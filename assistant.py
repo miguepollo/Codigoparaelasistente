@@ -77,7 +77,7 @@ def speak(text: str) -> None:
     if not _validate_piper_files():
         print("[TTS] Archivos de voz Piper ausentes o corruptos. Omite TTS.")
         return
-    # 1) Intento con CLI (rápido y ligero)
+    # 1) Intento con CLI (rápido y ligero) + aplay (evita PortAudio)
     try:
         cmd = ["piper", "-m", PIPER_MODEL, "-c", PIPER_CONFIG, "-f", "-"]
         proc = subprocess.Popen(
@@ -93,19 +93,20 @@ def speak(text: str) -> None:
         stderr_bytes = proc.stderr.read() if proc.stderr else b""
         proc.wait(timeout=30)
         if wav_bytes:
-            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-                num_channels = wf.getnchannels()
-                sample_width = wf.getsampwidth()
-                sample_rate = wf.getframerate()
-                frames = wf.readframes(wf.getnframes())
-            if sample_width != 2:
-                raise RuntimeError("Formato no soportado (se espera PCM16)")
-            audio = np.frombuffer(frames, dtype=np.int16)
-            if num_channels > 1:
-                audio = audio.reshape(-1, num_channels)
-            sd.play(audio, samplerate=sample_rate)
-            sd.wait()
-            return
+            # Reproducir con aplay para evitar PortAudio
+            try:
+                aplay_cmd = ["aplay", "-q", "-t", "wav", "-"]
+                aplay_dev = os.getenv("APLAY_DEVICE")
+                if aplay_dev:
+                    aplay_cmd = ["aplay", "-q", "-D", aplay_dev, "-t", "wav", "-"]
+                p = subprocess.Popen(aplay_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                assert p.stdin is not None
+                p.stdin.write(wav_bytes)
+                p.stdin.close()
+                p.wait()
+                return
+            except Exception as exc_play:
+                print(f"[TTS] Error reproduciendo con aplay: {exc_play}")
         else:
             if stderr_bytes:
                 print(f"[TTS] Piper CLI stderr: {stderr_bytes.decode(errors='ignore').strip()}")
@@ -119,10 +120,29 @@ def speak(text: str) -> None:
         if _piper_voice is None:
             from piper.voice import PiperVoice  # type: ignore
             _piper_voice = PiperVoice.load(PIPER_MODEL, PIPER_CONFIG)
-        pcm = _piper_voice.synthesize(text)
-        audio = np.frombuffer(pcm, dtype=np.int16)
-        sd.play(audio, samplerate=_piper_voice.config.sample_rate)
-        sd.wait()
+        pcm_iter = _piper_voice.synthesize(text)
+        # Construir WAV en memoria desde el generador PCM16 mono
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(_piper_voice.config.sample_rate)
+            for chunk in pcm_iter:
+                wf.writeframes(chunk)
+        wav_bytes = buf.getvalue()
+        try:
+            aplay_cmd = ["aplay", "-q", "-t", "wav", "-"]
+            aplay_dev = os.getenv("APLAY_DEVICE")
+            if aplay_dev:
+                aplay_cmd = ["aplay", "-q", "-D", aplay_dev, "-t", "wav", "-"]
+            p = subprocess.Popen(aplay_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            assert p.stdin is not None
+            p.stdin.write(wav_bytes)
+            p.stdin.close()
+            p.wait()
+            return
+        except Exception as exc_play:
+            print(f"[TTS] Error reproduciendo con aplay (fallback): {exc_play}")
     except Exception as exc:
         print(f"[TTS] Error en fallback Piper-tts: {exc}")
 
