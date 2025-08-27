@@ -131,9 +131,9 @@ def _validate_piper_files() -> bool:
 def create_wake_recognizer() -> vosk.KaldiRecognizer:
     assert _vosk_model is not None
     grammar = json.dumps([WAKE_WORD])
-    rec = vosk.KaldiRecognizer(_vosk_model, SAMPLE_RATE, grammar)
-    rec.SetWords(False)
-    return rec
+    recognizer = vosk.KaldiRecognizer(_vosk_model, SAMPLE_RATE, grammar)
+    recognizer.SetWords(False)
+    return recognizer
 
 
 def wait_for_wake_word() -> None:
