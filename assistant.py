@@ -238,7 +238,6 @@ def wait_for_wake_word() -> None:
         if status:
             pass
         q.put(bytes(indata))
-    print("Antes de crear el recognizer")
     with sd.RawInputStream(
         samplerate=SAMPLE_RATE,
         blocksize=BLOCKSIZE,
@@ -247,13 +246,10 @@ def wait_for_wake_word() -> None:
         callback=callback,
         device=sd.default.device,
     ):
-        print("Antes del while")
+
         while True:
-            print("Antes de get")
             data = q.get()
-            print("Despues de get")
             if recognizer.AcceptWaveform(data):
-                print("Antes de Result")
                 res = json.loads(recognizer.Result())
                 txt = res.get("text", "").lower()
                 print(f"txt: {txt}")
@@ -330,13 +326,11 @@ def main() -> None:
         print("[Wake word] detectada")
         # Nuevo recognizer para el siguiente enunciado
         command_recognizer = create_recognizer()
-        print("Aquí funciona?")
         command = listen_command(command_recognizer)
         print(f"command: {command}")
         if not command:
             cooldown_end_ts = time.time() + 1.0
             continue
-        print(f"[Usuario] {command}")
         try:
             response = ollama.chat(
                 model=OLLAMA_MODEL,
