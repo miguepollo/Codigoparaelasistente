@@ -29,6 +29,7 @@ MAX_COMMAND_SECS = 12
 OLLAMA_MODEL = "gemma3:1b"
 
 _piper_voice = None  # Lazy init para fallback Python
+_vosk_model: Optional[vosk.Model] = None  # Reutilizar modelo en memoria
 
 
 def ensure_paths() -> None:
@@ -38,7 +39,9 @@ def ensure_paths() -> None:
         raise FileNotFoundError(
             f"No se encontraron los archivos de voz de Piper en {os.path.dirname(PIPER_MODEL)}"
         )
-
+    global _vosk_model
+    if _vosk_model is None:
+        _vosk_model = vosk.Model(VOSK_MODEL_DIR)
 
 def _rms_int16(audio: np.ndarray) -> float:
     if audio.size == 0:
@@ -106,8 +109,8 @@ def speak(text: str) -> None:
 
 
 def create_recognizer() -> vosk.KaldiRecognizer:
-    model = vosk.Model(VOSK_MODEL_DIR)
-    rec = vosk.KaldiRecognizer(model, SAMPLE_RATE)
+    assert _vosk_model is not None
+    rec = vosk.KaldiRecognizer(_vosk_model, SAMPLE_RATE)
     rec.SetWords(True)
     return rec
 
@@ -125,8 +128,17 @@ def _validate_piper_files() -> bool:
         return False
 
 
-def wait_for_wake_word(recognizer: vosk.KaldiRecognizer) -> None:
+def create_wake_recognizer() -> vosk.KaldiRecognizer:
+    assert _vosk_model is not None
+    grammar = json.dumps([WAKE_WORD])
+    rec = vosk.KaldiRecognizer(_vosk_model, SAMPLE_RATE, grammar)
+    rec.SetWords(False)
+    return rec
+
+
+def wait_for_wake_word() -> None:
     q: "queue.Queue[bytes]" = queue.Queue()
+    recognizer = create_wake_recognizer()
 
     def callback(indata, frames, t, status):
         if status:
@@ -145,13 +157,7 @@ def wait_for_wake_word(recognizer: vosk.KaldiRecognizer) -> None:
             if recognizer.AcceptWaveform(data):
                 res = json.loads(recognizer.Result())
                 txt = res.get("text", "").lower()
-                if txt and WAKE_WORD in txt:
-                    return
-            else:
-                # Consultar resultados parciales para latencia menor
-                partial = json.loads(recognizer.PartialResult() or "{}")
-                ptxt = partial.get("partial", "").lower()
-                if ptxt and WAKE_WORD in ptxt:
+                if txt == WAKE_WORD:
                     return
 
 
@@ -211,16 +217,21 @@ def listen_command(recognizer: vosk.KaldiRecognizer) -> str:
 def main() -> None:
     ensure_paths()
     print("Asistente listo. Di 'asistente' para activar.")
-    base_recognizer = create_recognizer()
+    cooldown_end_ts = 0.0
 
     while True:
         print("[Esperando palabra de activación]")
-        wait_for_wake_word(base_recognizer)
+        # Evitar re-disparo inmediato
+        now = time.time()
+        if now < cooldown_end_ts:
+            time.sleep(max(0.0, cooldown_end_ts - now))
+        wait_for_wake_word()
         print("[Wake word] detectada")
         # Nuevo recognizer para el siguiente enunciado
         command_recognizer = create_recognizer()
         command = listen_command(command_recognizer)
         if not command:
+            cooldown_end_ts = time.time() + 1.0
             continue
         print(f"[Usuario] {command}")
         try:
@@ -233,8 +244,8 @@ def main() -> None:
             reply = f"Hubo un error consultando el modelo: {exc}"
         print(f"[IA] {reply}")
         speak(reply)
-        # Reiniciar el recognizer base para seguir escuchando wake word
-        base_recognizer = create_recognizer()
+        # Pequeño cooldown para evitar re-disparos con ruido residual
+        cooldown_end_ts = time.time() + 1.5
 
 
 if __name__ == "__main__":
