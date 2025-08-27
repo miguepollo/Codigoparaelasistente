@@ -28,3 +28,7 @@ ollama pull gemma3:1b
 
 El asistente espera la palabra de activación "asistente" y luego responde con Piper.
 
+## Agradecimientos
+A @rhasspy por su proyecto  [PiperTTS](https://github.com/OHF-Voice/piper1-gpl) muchas gracias!!!
+
+A @alphacep por su speech-to-text [Vosk](https://github.com/alphacep/vosk-api) me ha servido de mucha utilidad vosk y sobre todo los ejemplos :D !!!
