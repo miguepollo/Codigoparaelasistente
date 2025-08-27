@@ -147,7 +147,7 @@ def wait_for_wake_word() -> None:
         if status:
             pass
         q.put(bytes(indata))
-
+    print("Antes de crear el recognizer")
     with sd.RawInputStream(
         samplerate=SAMPLE_RATE,
         blocksize=BLOCKSIZE,
@@ -155,11 +155,16 @@ def wait_for_wake_word() -> None:
         channels=1,
         callback=callback,
     ):
+        print("Antes del while")
         while True:
+            print("Antes de get")
             data = q.get()
+            print("Despues de get")
             if recognizer.AcceptWaveform(data):
+                print("Antes de Result")
                 res = json.loads(recognizer.Result())
                 txt = res.get("text", "").lower()
+                print(f"txt: {txt}")
                 if txt == WAKE_WORD:
                     return
 
