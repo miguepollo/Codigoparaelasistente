@@ -51,6 +51,10 @@ def _rms_int16(audio: np.ndarray) -> float:
 def speak(text: str) -> None:
     if not text:
         return
+    # Validar ficheros de voz Piper
+    if not _validate_piper_files():
+        print("[TTS] Archivos de voz Piper ausentes o corruptos. Omite TTS.")
+        return
     # 1) Intento con CLI (rápido y ligero)
     try:
         cmd = ["piper", "-m", PIPER_MODEL, "-c", PIPER_CONFIG, "-f", "-"]
@@ -106,6 +110,19 @@ def create_recognizer() -> vosk.KaldiRecognizer:
     rec = vosk.KaldiRecognizer(model, SAMPLE_RATE)
     rec.SetWords(True)
     return rec
+
+
+def _validate_piper_files() -> bool:
+    try:
+        if not os.path.isfile(PIPER_MODEL) or os.path.getsize(PIPER_MODEL) < 1024:
+            return False
+        if not os.path.isfile(PIPER_CONFIG) or os.path.getsize(PIPER_CONFIG) < 20:
+            return False
+        with open(PIPER_CONFIG, "r", encoding="utf-8") as fh:
+            json.load(fh)
+        return True
+    except Exception:
+        return False
 
 
 def wait_for_wake_word(recognizer: vosk.KaldiRecognizer) -> None:
@@ -200,7 +217,6 @@ def main() -> None:
         print("[Esperando palabra de activación]")
         wait_for_wake_word(base_recognizer)
         print("[Wake word] detectada")
-        speak("¿En qué puedo ayudarte?")
         # Nuevo recognizer para el siguiente enunciado
         command_recognizer = create_recognizer()
         command = listen_command(command_recognizer)
