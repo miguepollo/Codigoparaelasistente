@@ -53,11 +53,11 @@ if ! command -v ollama >/dev/null 2>&1; then
   chmod +x ollama || true
 fi
 
-echo "[7/7] Intentando iniciar servidor de Ollama y predescargar gemma:1b (best-effort)"
+echo "[7/7] Intentando iniciar servidor de Ollama y predescargar gemma3:1b (best-effort)"
 if command -v ollama >/dev/null 2>&1; then
   pgrep -x ollama >/dev/null 2>&1 || nohup ollama serve >/dev/null 2>&1 &
   sleep 3 || true
-  ollama pull gemma:1b || true
+  ollama pull gemma3:1b || true
 fi
 
 echo "Setup completado en modo usuario. Si faltan codecs ALSA u otros, instala con 'sudo nala install alsa-utils sox ffmpeg portaudio19-dev'"
