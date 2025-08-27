@@ -229,7 +229,9 @@ def main() -> None:
         print("[Wake word] detectada")
         # Nuevo recognizer para el siguiente enunciado
         command_recognizer = create_recognizer()
+        print("Aquí funciona?")
         command = listen_command(command_recognizer)
+        print(f"command: {command}")
         if not command:
             cooldown_end_ts = time.time() + 1.0
             continue

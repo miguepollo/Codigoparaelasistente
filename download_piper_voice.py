@@ -4,8 +4,8 @@ import urllib.request
 
 
 DEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
-VOICE_ONNX = "es_ES-emilia-low.onnx"
-VOICE_JSON = "es_ES-emilia-low.onnx.json"
+VOICE_ONNX = "es_ES-sharvard-low.onnx"
+VOICE_JSON = "es_ES-sharvard-low.onnx.json"
 
 URL_BASES = [
     "https://github.com/rhasspy/piper/releases/latest/download",
@@ -46,7 +46,7 @@ def main() -> int:
             break
 
     if not (onnx_ok and json_ok):
-        print("No se pudo descargar la voz es_ES-emilia-low. Descárgala manualmente.")
+        print("No se pudo descargar la voz es_ES-sharvard-low. Descárgala manualmente.")
         return 1
 
     print("Voz descargada correctamente.")
