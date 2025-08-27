@@ -37,13 +37,13 @@ if [ ! -f "$HOME/assistant/models/.vosk_downloaded" ]; then
   touch "$HOME/assistant/models/.vosk_downloaded"
 fi
 
-echo "[5/7] Descargando voz de Piper (es_ES) si no existe..."
+echo "[5/7] Descargando voz de Piper (es_ES-sharvard-medium) si no existe..."
 mkdir -p "$HOME/assistant/voices"
 cd "$HOME/assistant/voices"
-if [ ! -f es_ES-sharvard-low.onnx ] || [ ! -f es_ES-sharvard-low.onnx.json ]; then
-  base_hf="https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/es_ES-sharvard-low"
-  wget -q "${base_hf}/es_ES-sharvard-low.onnx" -O es_ES-sharvard-low.onnx || true
-  wget -q "${base_hf}/es_ES-sharvard-low.onnx.json" -O es_ES-sharvard-low.onnx.json || true
+if [ ! -f es_ES-sharvard-medium.onnx ] || [ ! -f es_ES-sharvard-medium.onnx.json ]; then
+  base_hf="https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/sharvard/medium"
+  curl -L "${base_hf}/es_ES-sharvard-medium.onnx" -o es_ES-sharvard-medium.onnx || true
+  curl -L "${base_hf}/es_ES-sharvard-medium.onnx.json" -o es_ES-sharvard-medium.onnx.json || true
 fi
 
 echo "[6/7] Instalando Ollama (binario arm64 en usuario) si no existe..."

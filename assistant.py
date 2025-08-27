@@ -17,9 +17,17 @@ import ollama
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOSK_MODEL_DIR = os.path.join(BASE_DIR, "models", "vosk")
-PIPER_MODEL = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-low.onnx")
-PIPER_CONFIG = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-low.onnx.json")
+PIPER_MODEL = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-medium.onnx")
+PIPER_CONFIG = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-medium.onnx.json")
 VOICES_DIR = os.path.join(BASE_DIR, "voices")
+# Permitir override por variables de entorno
+env_model = os.getenv("PIPER_MODEL")
+env_config = os.getenv("PIPER_CONFIG")
+if env_model:
+    PIPER_MODEL = env_model
+if env_config:
+    PIPER_CONFIG = env_config
+
 
 # Configuración de audio basada en ejemplo probado
 sd.default.device = 'rockchip,es8388'
@@ -128,17 +136,27 @@ def create_recognizer() -> vosk.KaldiRecognizer:
 
 def _validate_piper_files() -> bool:
     try:
-        if not os.path.isfile(PIPER_MODEL) or os.path.getsize(PIPER_MODEL) < 1024:
-            print(f"[TTS] Modelo no encontrado o muy pequeño: {PIPER_MODEL}")
+        if not os.path.isfile(PIPER_MODEL):
+            print(f"[TTS] Modelo no encontrado: {PIPER_MODEL}")
             return False
-        if not os.path.isfile(PIPER_CONFIG) or os.path.getsize(PIPER_CONFIG) < 20:
-            print(f"[TTS] Config no encontrada o muy pequeña: {PIPER_CONFIG}")
+        if not os.path.isfile(PIPER_CONFIG):
+            print(f"[TTS] Config no encontrada: {PIPER_CONFIG}")
+            return False
+        model_size = os.path.getsize(PIPER_MODEL)
+        cfg_size = os.path.getsize(PIPER_CONFIG)
+        print(f"[TTS] Tamaños -> model: {model_size} bytes, config: {cfg_size} bytes")
+        # Umbrales razonables (onnx suele ser > 1MB, json > 100 bytes)
+        if model_size < 1_000_000:
+            print(f"[TTS] Modelo demasiado pequeño (posible descarga incompleta): {PIPER_MODEL}")
+            return False
+        if cfg_size < 100:
+            print(f"[TTS] Config demasiado pequeña (posible descarga incompleta): {PIPER_CONFIG}")
             return False
         with open(PIPER_CONFIG, "r", encoding="utf-8") as fh:
             json.load(fh)
         return True
-    except Exception:
-        print(f"[TTS] Error leyendo JSON de config: {PIPER_CONFIG}")
+    except Exception as exc:
+        print(f"[TTS] Error leyendo JSON de config {PIPER_CONFIG}: {exc}")
         return False
 
 
@@ -159,7 +177,12 @@ def _discover_and_set_piper_voice() -> None:
                     cfg = os.path.join(VOICES_DIR, base + ".json")
                 model_path = os.path.join(VOICES_DIR, name)
                 if os.path.isfile(model_path) and os.path.isfile(cfg):
-                    candidates.append((model_path, cfg))
+                    # Filtra por tamaños mínimos para evitar HTML/descargas vacías
+                    try:
+                        if os.path.getsize(model_path) >= 1_000_000 and os.path.getsize(cfg) >= 100:
+                            candidates.append((model_path, cfg))
+                    except Exception:
+                        continue
         # Prefiere voces de español
         candidates.sort(key=lambda t: (0 if "/es_" in t[0] or "es_" in os.path.basename(t[0]) else 1, t[0]))
         for model_path, cfg in candidates:
