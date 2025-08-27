@@ -19,6 +19,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOSK_MODEL_DIR = os.path.join(BASE_DIR, "models", "vosk")
 PIPER_MODEL = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-low.onnx")
 PIPER_CONFIG = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-low.onnx.json")
+VOICES_DIR = os.path.join(BASE_DIR, "voices")
 
 # Configuración de audio basada en ejemplo probado
 sd.default.device = 'rockchip,es8388'
@@ -63,6 +64,7 @@ def _rms_int16(audio: np.ndarray) -> float:
 def speak(text: str) -> None:
     if not text:
         return
+    _discover_and_set_piper_voice()
     # Validar ficheros de voz Piper
     if not _validate_piper_files():
         print("[TTS] Archivos de voz Piper ausentes o corruptos. Omite TTS.")
@@ -127,14 +129,51 @@ def create_recognizer() -> vosk.KaldiRecognizer:
 def _validate_piper_files() -> bool:
     try:
         if not os.path.isfile(PIPER_MODEL) or os.path.getsize(PIPER_MODEL) < 1024:
+            print(f"[TTS] Modelo no encontrado o muy pequeño: {PIPER_MODEL}")
             return False
         if not os.path.isfile(PIPER_CONFIG) or os.path.getsize(PIPER_CONFIG) < 20:
+            print(f"[TTS] Config no encontrada o muy pequeña: {PIPER_CONFIG}")
             return False
         with open(PIPER_CONFIG, "r", encoding="utf-8") as fh:
             json.load(fh)
         return True
     except Exception:
+        print(f"[TTS] Error leyendo JSON de config: {PIPER_CONFIG}")
         return False
+
+
+def _discover_and_set_piper_voice() -> None:
+    """Si los paths actuales no son válidos, intenta detectar cualquier voz válida en voices/."""
+    global PIPER_MODEL, PIPER_CONFIG
+    if _validate_piper_files():
+        return
+    try:
+        if not os.path.isdir(VOICES_DIR):
+            return
+        candidates = []
+        for name in os.listdir(VOICES_DIR):
+            if name.endswith(".onnx"):
+                base = name[:-5]
+                cfg = os.path.join(VOICES_DIR, base + ".onnx.json")
+                if not os.path.isfile(cfg):
+                    cfg = os.path.join(VOICES_DIR, base + ".json")
+                model_path = os.path.join(VOICES_DIR, name)
+                if os.path.isfile(model_path) and os.path.isfile(cfg):
+                    candidates.append((model_path, cfg))
+        # Prefiere voces de español
+        candidates.sort(key=lambda t: (0 if "/es_" in t[0] or "es_" in os.path.basename(t[0]) else 1, t[0]))
+        for model_path, cfg in candidates:
+            try:
+                with open(cfg, "r", encoding="utf-8") as fh:
+                    json.load(fh)
+                PIPER_MODEL = model_path
+                PIPER_CONFIG = cfg
+                print(f"[TTS] Voz Piper detectada: {PIPER_MODEL}, {PIPER_CONFIG}")
+                return
+            except Exception:
+                continue
+    except Exception:
+        return
 
 
 def create_wake_recognizer() -> vosk.KaldiRecognizer:
