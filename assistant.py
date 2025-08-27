@@ -20,8 +20,10 @@ VOSK_MODEL_DIR = os.path.join(BASE_DIR, "models", "vosk")
 PIPER_MODEL = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-low.onnx")
 PIPER_CONFIG = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-low.onnx.json")
 
+# Configuración de audio basada en ejemplo probado
+sd.default.device = 'rockchip,es8388'
 SAMPLE_RATE = 16000
-BLOCKSIZE = 4096  # Latencia menor que 8000
+BLOCKSIZE = 8000
 WAKE_WORD = "asistente"
 SILENCE_THRESHOLD = 300  # RMS ~ energía. Ajustar si hace falta
 SILENCE_MS = 650  # fin por silencio
@@ -39,6 +41,13 @@ def ensure_paths() -> None:
         raise FileNotFoundError(
             f"No se encontraron los archivos de voz de Piper en {os.path.dirname(PIPER_MODEL)}"
         )
+    # Detectar sample rate real del dispositivo de entrada
+    global SAMPLE_RATE
+    try:
+        device_info = sd.query_devices(sd.default.device, "input")
+        SAMPLE_RATE = int(device_info.get("default_samplerate", SAMPLE_RATE))
+    except Exception:
+        pass
     global _vosk_model
     if _vosk_model is None:
         _vosk_model = vosk.Model(VOSK_MODEL_DIR)
@@ -154,6 +163,7 @@ def wait_for_wake_word() -> None:
         dtype="int16",
         channels=1,
         callback=callback,
+        device=sd.default.device,
     ):
         print("Antes del while")
         while True:
@@ -189,6 +199,7 @@ def listen_command(recognizer: vosk.KaldiRecognizer) -> str:
         dtype="int16",
         channels=1,
         callback=callback,
+        device=sd.default.device,
     ):
         transcript = ""
         while True:
