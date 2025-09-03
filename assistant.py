@@ -1,12 +1,13 @@
 import os
-import sys
 import json
 import time
-import math
 import queue
 import subprocess
+import threading
+import re
 import io
 import wave
+import shutil
 from typing import Optional
 
 import numpy as np
@@ -34,10 +35,22 @@ sd.default.device = 'rockchip,es8388'
 SAMPLE_RATE = 16000
 BLOCKSIZE = 8000
 WAKE_WORD = "asistente"
-SILENCE_THRESHOLD = 300  # RMS ~ energía. Ajustar si hace falta
-SILENCE_MS = 650  # fin por silencio
+SILENCE_THRESHOLD = 600  # RMS ~ energía. Ajustar si hace falta
+SILENCE_MS = 1300  # fin por silencio
 MAX_COMMAND_SECS = 12
-OLLAMA_MODEL = "gemma3:1b"
+OLLAMA_MODEL = "gemma3:270m"
+# Permite configurar el endpoint de Ollama, p.ej.: OLLAMA_HOST="http://127.0.0.1:11434"
+OLLAMA_HOST = "http://127.0.0.1:11434"
+# Prompt personalizado para el asistente (puedes modificarlo o usar variable de entorno)
+OLLAMA_PROMPT = os.getenv("OLLAMA_PROMPT", """You are a voice assistant called Kubik. Always respond with plain text. Your response can only contain 100 words or less. Always respond in Spanish.""")
+
+def build_ollama_messages(user_message: str) -> list:
+    """Construye los mensajes para enviar a Ollama incluyendo el prompt del sistema."""
+    messages = []
+    if OLLAMA_PROMPT.strip():
+        messages.append({"role": "system", "content": OLLAMA_PROMPT.strip()})
+    messages.append({"role": "user", "content": user_message})
+    return messages
 
 _piper_voice = None  # Lazy init para fallback Python
 _vosk_model: Optional[vosk.Model] = None  # Reutilizar modelo en memoria
@@ -72,79 +85,550 @@ def _rms_int16(audio: np.ndarray) -> float:
 def speak(text: str) -> None:
     if not text:
         return
-    _discover_and_set_piper_voice()
+
+    print(f"[TTS] Intentando sintetizar: '{text[:100]}...'")
+    _discover_and_set_piper_voice()  # Asegurar que la voz esté configurada
+
     # Validar ficheros de voz Piper
     if not _validate_piper_files():
         print("[TTS] Archivos de voz Piper ausentes o corruptos. Omite TTS.")
         return
-    # 1) Intento con CLI (rápido y ligero) + aplay (evita PortAudio)
+    # 1) Streaming con CLI de Piper → aplay (empieza a sonar de inmediato)
     try:
         cmd = ["piper", "-m", PIPER_MODEL, "-c", PIPER_CONFIG, "-f", "-"]
-        proc = subprocess.Popen(
+        print(f"[TTS] Lanzando Piper CLI streaming: {' '.join(cmd)}")
+        proc_tts = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            text=False,
+            bufsize=0,
         )
-        assert proc.stdin is not None and proc.stdout is not None
-        proc.stdin.write((text.strip() + "\n").encode("utf-8"))
-        proc.stdin.close()
-        wav_bytes = proc.stdout.read()
-        stderr_bytes = proc.stderr.read() if proc.stderr else b""
-        proc.wait(timeout=30)
-        if wav_bytes:
-            # Reproducir con aplay para evitar PortAudio
-            try:
-                aplay_cmd = ["aplay", "-q", "-t", "wav", "-"]
-                aplay_dev = os.getenv("APLAY_DEVICE")
-                if aplay_dev:
-                    aplay_cmd = ["aplay", "-q", "-D", aplay_dev, "-t", "wav", "-"]
-                p = subprocess.Popen(aplay_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                assert p.stdin is not None
-                p.stdin.write(wav_bytes)
-                p.stdin.close()
-                p.wait()
-                return
-            except Exception as exc_play:
-                print(f"[TTS] Error reproduciendo con aplay: {exc_play}")
-        else:
-            if stderr_bytes:
-                print(f"[TTS] Piper CLI stderr: {stderr_bytes.decode(errors='ignore').strip()}")
-            print("[TTS] Piper no devolvió audio por CLI. Probando fallback Python...")
-    except Exception as exc:
-        print(f"[TTS] Error en Piper CLI: {exc}. Probando fallback Python...")
+        assert proc_tts.stdin is not None and proc_tts.stdout is not None
 
-    # 2) Fallback: librería piper-tts (ONNXRuntime)
+        def build_aplay_cmd(use_plug: bool) -> list:
+            base = ["aplay", "-q", "-t", "wav", "-"]
+            aplay_dev = os.getenv("APLAY_DEVICE")
+            if aplay_dev:
+                dev = aplay_dev
+                if use_plug and aplay_dev.startswith("hw:"):
+                    dev = "plughw:" + aplay_dev.split(":", 1)[1]
+                return ["aplay", "-q", "-D", dev, "-t", "wav", "-"]
+            return base
+
+        # Si es dispositivo hw:* y tenemos sox, insertar conversión a 48k/16-bit/estéreo
+        aplay_dev_env = os.getenv("APLAY_DEVICE", "")
+        have_sox = shutil.which("sox") is not None
+        if aplay_dev_env.startswith("hw:") and have_sox:
+            sox_cmd = [
+                "sox",
+                "-t", "wav", "-",  # entrada WAV desde Piper
+                "-r", "48000",
+                "-b", "16",
+                "-c", "2",
+                "-t", "wav", "-",  # salida WAV hacia aplay
+            ]
+            print(f"[TTS] Insertando conversión con sox: {' '.join(sox_cmd)}")
+            proc_sox = subprocess.Popen(
+                sox_cmd,
+                stdin=proc_tts.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            # aplay leerá desde la salida de sox
+            aplay_cmd = build_aplay_cmd(use_plug=False)
+            print(f"[TTS] Encadenando aplay streaming: {' '.join(aplay_cmd)}")
+            proc_play = subprocess.Popen(
+                aplay_cmd,
+                stdin=proc_sox.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        else:
+            # Intento 1: usar dispositivo tal cual (hw/plughw/default)
+            aplay_cmd = build_aplay_cmd(use_plug=False)
+            print(f"[TTS] Encadenando aplay streaming: {' '.join(aplay_cmd)}")
+            proc_play = subprocess.Popen(
+                aplay_cmd,
+                stdin=proc_tts.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        # Escribir el texto a Piper para que empiece a generar
+        proc_tts.stdin.write((text.strip() + "\n").encode("utf-8"))
+        proc_tts.stdin.flush()
+        proc_tts.stdin.close()
+        # No cerrar proc_tts.stdout aquí; es la tubería hacia aplay
+
+        ret_aplay = proc_play.wait()
+        if ret_aplay != 0:
+            err_play1 = b""
+            try:
+                err_play1 = proc_play.stderr.read() or b""
+            except Exception:
+                pass
+            # Terminar Piper para evitar BrokenPipe masivo
+            try:
+                proc_tts.kill()
+            except Exception:
+                pass
+
+            # Reintentar con plughw si el dispositivo era hw
+            aplay_dev_env = os.getenv("APLAY_DEVICE", "")
+            # Intento alternativo: 'default' puro
+            if aplay_dev_env and aplay_dev_env != "default":
+                aplay_cmd_def = ["aplay", "-q", "-D", "default", "-t", "wav", "-"]
+                print(f"[TTS] Reintentando con dispositivo 'default': {' '.join(aplay_cmd_def)}")
+                proc_tts = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=False,
+                    bufsize=0,
+                )
+                assert proc_tts.stdin is not None and proc_tts.stdout is not None
+                proc_play = subprocess.Popen(
+                    aplay_cmd_def,
+                    stdin=proc_tts.stdout,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                proc_tts.stdin.write((text.strip() + "\n").encode("utf-8"))
+                proc_tts.stdin.flush()
+                proc_tts.stdin.close()
+                ret_aplay2 = proc_play.wait()
+                if ret_aplay2 == 0:
+                    _ = proc_tts.wait(timeout=60)
+                    print("[TTS] Streaming Piper → aplay (default) finalizado correctamente")
+                    return
+                else:
+                    try:
+                        err_play_def = proc_play.stderr.read() or b""
+                        if err_play_def:
+                            print(f"[TTS] aplay (default) error: {err_play_def.decode(errors='ignore').strip()}")
+                    except Exception:
+                        pass
+
+            if aplay_dev_env.startswith("hw:"):
+                aplay_cmd2 = build_aplay_cmd(use_plug=True)
+                print(f"[TTS] Reintentando con plughw: {' '.join(aplay_cmd2)}")
+                # Relanzar Piper para un stream nuevo
+                proc_tts = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=False,
+                    bufsize=0,
+                )
+                assert proc_tts.stdin is not None and proc_tts.stdout is not None
+                proc_play = subprocess.Popen(
+                    aplay_cmd2,
+                    stdin=proc_tts.stdout,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                proc_tts.stdin.write((text.strip() + "\n").encode("utf-8"))
+                proc_tts.stdin.flush()
+                proc_tts.stdin.close()
+                ret_aplay = proc_play.wait()
+                if ret_aplay == 0:
+                    # Esperar Piper a terminar y salir
+                    _ = proc_tts.wait(timeout=60)
+                    print("[TTS] Streaming Piper → aplay (plughw) finalizado correctamente")
+                    return
+                else:
+                    try:
+                        err_play2 = proc_play.stderr.read() or b""
+                    except Exception:
+                        err_play2 = b""
+                    print(f"[TTS] aplay (plughw) error: {err_play2.decode(errors='ignore').strip()}")
+                    # Si tenemos sox, último intento: Piper → sox (48k/2ch) → aplay hw
+                    if have_sox:
+                        sox_cmd = [
+                            "sox",
+                            "-t", "wav", "-",
+                            "-r", "48000",
+                            "-b", "16",
+                            "-c", "2",
+                            "-t", "wav", "-",
+                        ]
+                        print(f"[TTS] Intentando conversión final con sox hacia hw: {' '.join(sox_cmd)}")
+                        proc_tts = subprocess.Popen(
+                            cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=False,
+                            bufsize=0,
+                        )
+                        assert proc_tts.stdin is not None and proc_tts.stdout is not None
+                        proc_sox = subprocess.Popen(
+                            sox_cmd,
+                            stdin=proc_tts.stdout,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        )
+                        aplay_cmd_hw = ["aplay", "-q", "-D", aplay_dev_env, "-t", "wav", "-"]
+                        print(f"[TTS] Encadenando aplay (hw) tras sox: {' '.join(aplay_cmd_hw)}")
+                        proc_play = subprocess.Popen(
+                            aplay_cmd_hw,
+                            stdin=proc_sox.stdout,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                        )
+                        proc_tts.stdin.write((text.strip() + "\n").encode("utf-8"))
+                        proc_tts.stdin.flush()
+                        proc_tts.stdin.close()
+                        ret_aplay3 = proc_play.wait()
+                        if ret_aplay3 == 0:
+                            _ = proc_tts.wait(timeout=60)
+                            print("[TTS] Streaming Piper → sox → aplay (hw) finalizado correctamente")
+                            return
+                        else:
+                            try:
+                                err_ap3 = proc_play.stderr.read() or b""
+                                print(f"[TTS] aplay (hw tras sox) error: {err_ap3.decode(errors='ignore').strip()}")
+                            except Exception:
+                                pass
+
+            # Si sigue mal, leer stderr de Piper para registro
+            try:
+                err_tts = proc_tts.stderr.read() or b""
+                if err_play1:
+                    print(f"[TTS] aplay error: {err_play1.decode(errors='ignore').strip()}")
+                if err_tts:
+                    print(f"[TTS] Piper CLI stderr: {err_tts.decode(errors='ignore').strip()}")
+            except Exception:
+                pass
+            raise RuntimeError("aplay falló")
+        else:
+            # Esperar Piper a terminar y salir
+            ret_tts = proc_tts.wait(timeout=60)
+            if ret_tts == 0:
+                print("[TTS] Streaming Piper → aplay finalizado correctamente")
+                return
+            else:
+                try:
+                    err_tts = proc_tts.stderr.read() or b""
+                    if err_tts:
+                        print(f"[TTS] Piper CLI stderr: {err_tts.decode(errors='ignore').strip()}")
+                except Exception:
+                    pass
+                raise RuntimeError("Piper CLI falló")
+    except Exception as exc:
+        print(f"[TTS] Error en streaming Piper CLI: {exc}. Probando fallback Python...")
+
+    # 2) Fallback: piper-tts → WAV en memoria → aplay (mayor compatibilidad)
     try:
+        print("[TTS] Inicializando fallback piper-tts (WAV en memoria)…")
         global _piper_voice
         if _piper_voice is None:
+            print(f"[TTS] Cargando modelo: {PIPER_MODEL}")
             from piper.voice import PiperVoice  # type: ignore
             _piper_voice = PiperVoice.load(PIPER_MODEL, PIPER_CONFIG)
+            print(f"[TTS] Modelo cargado correctamente, sample rate: {_piper_voice.config.sample_rate}")
+
         pcm_iter = _piper_voice.synthesize(text)
-        # Construir WAV en memoria desde el generador PCM16 mono
+
+        # Construir WAV completo en memoria (PCM16 mono)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(_piper_voice.config.sample_rate)
             for chunk in pcm_iter:
-                wf.writeframes(chunk)
+                try:
+                    if hasattr(chunk, '__class__') and 'AudioChunk' in str(chunk.__class__):
+                        if hasattr(chunk, 'pcm'):
+                            if isinstance(chunk.pcm, (bytes, bytearray)):
+                                data = chunk.pcm
+                            elif hasattr(chunk.pcm, 'tobytes'):
+                                data = chunk.pcm.tobytes()
+                            else:
+                                data = bytes(chunk.pcm)
+                        elif hasattr(chunk, 'data'):
+                            data = chunk.data
+                        else:
+                            data = bytes(chunk)
+                    elif isinstance(chunk, (bytes, bytearray)):
+                        data = chunk
+                    elif hasattr(chunk, 'tobytes'):
+                        data = chunk.tobytes()
+                    else:
+                        data = bytes(chunk)
+                    if data:
+                        wf.writeframes(data)
+                except Exception:
+                    continue
         wav_bytes = buf.getvalue()
-        try:
-            aplay_cmd = ["aplay", "-q", "-t", "wav", "-"]
-            aplay_dev = os.getenv("APLAY_DEVICE")
-            if aplay_dev:
-                aplay_cmd = ["aplay", "-q", "-D", aplay_dev, "-t", "wav", "-"]
-            p = subprocess.Popen(aplay_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            assert p.stdin is not None
-            p.stdin.write(wav_bytes)
-            p.stdin.close()
-            p.wait()
-            return
-        except Exception as exc_play:
-            print(f"[TTS] Error reproduciendo con aplay (fallback): {exc_play}")
+
+        def build_wav_cmd(device: str | None) -> list:
+            if device is None:
+                return ["aplay", "-q", "-t", "wav", "-"]
+            return ["aplay", "-q", "-D", device, "-t", "wav", "-"]
+
+        # Intentar con APLAY_DEVICE
+        device_env = os.getenv("APLAY_DEVICE")
+        tried = []
+        for dev in [device_env, "default", None]:
+            if dev in tried:
+                continue
+            tried.append(dev)
+            cmd_ap = build_wav_cmd(dev)
+            try:
+                p = subprocess.Popen(cmd_ap, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                assert p.stdin is not None
+                p.stdin.write(wav_bytes)
+                p.stdin.close()
+                rc = p.wait()
+                if rc == 0:
+                    print("[TTS] Reproducción exitosa con WAV en memoria")
+                    return
+                else:
+                    err = p.stderr.read() or b""
+                    print(f"[TTS] aplay (WAV) código {rc} con dispositivo {dev or 'por defecto'}: {err.decode(errors='ignore').strip()}")
+            except Exception as exc_:
+                print(f"[TTS] Error lanzando aplay (WAV) con dispositivo {dev or 'por defecto'}: {exc_}")
     except Exception as exc:
-        print(f"[TTS] Error en fallback Piper-tts: {exc}")
+        print(f"[TTS] Error en fallback Piper-tts (streaming): {exc}")
+
+
+class AudioPipeline:
+    """Tubería de audio persistente para enviar PCM16 mono a aplay,
+    opcionalmente pasando por sox para convertir a parámetros que el hw acepte.
+    """
+
+    def __init__(self, input_rate: int) -> None:
+        self.input_rate = int(input_rate)
+        self.proc_sox: Optional[subprocess.Popen] = None
+        self.proc_play: Optional[subprocess.Popen] = None
+        self.stdin = None
+        self._start_pipeline()
+
+    def _start_pipeline(self) -> None:
+        device = os.getenv("APLAY_DEVICE", "")
+        have_sox = shutil.which("sox") is not None
+        # Preferir conversión con sox si el destino es hw:*
+        if device.startswith("hw:") and have_sox:
+            sox_cmd = [
+                "sox",
+                "-t", "raw",
+                "-r", str(self.input_rate),
+                "-e", "signed",
+                "-b", "16",
+                "-c", "1",
+                "-L",
+                "-",
+                "-r", "48000",
+                "-b", "16",
+                "-c", "2",
+                "-t", "wav", "-",
+            ]
+            self.proc_sox = subprocess.Popen(
+                sox_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            assert self.proc_sox.stdin is not None and self.proc_sox.stdout is not None
+            self.stdin = self.proc_sox.stdin
+            play_cmd = ["aplay", "-q", "-D", device, "-t", "wav", "-"] if device else ["aplay", "-q", "-t", "wav", "-"]
+            self.proc_play = subprocess.Popen(
+                play_cmd,
+                stdin=self.proc_sox.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        else:
+            # Directo a aplay en RAW (usa plughw si así está en APLAY_DEVICE)
+            play_cmd = [
+                "aplay", "-q",
+                "-t", "raw",
+                "-f", "S16_LE",
+                "-c", "1",
+                "-r", str(self.input_rate),
+                "-",
+            ]
+            if device:
+                play_cmd = [
+                    "aplay", "-q",
+                    "-D", device,
+                    "-t", "raw",
+                    "-f", "S16_LE",
+                    "-c", "1",
+                    "-r", str(self.input_rate),
+                    "-",
+                ]
+            self.proc_play = subprocess.Popen(
+                play_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            assert self.proc_play.stdin is not None
+            self.stdin = self.proc_play.stdin
+
+    def write(self, data: bytes) -> None:
+        if not data:
+            return
+        if self.stdin is None:
+            return
+        try:
+            self.stdin.write(data)
+            try:
+                self.stdin.flush()
+            except Exception:
+                pass
+        except Exception:
+            # Intentar no romper la app si el dispositivo desaparece
+            pass
+
+    def close(self) -> None:
+        try:
+            if self.stdin:
+                try:
+                    self.stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    self.stdin.close()
+                except Exception:
+                    pass
+        finally:
+            if self.proc_play is not None:
+                try:
+                    self.proc_play.wait(timeout=2)
+                except Exception:
+                    try:
+                        self.proc_play.kill()
+                    except Exception:
+                        pass
+            if self.proc_sox is not None:
+                try:
+                    self.proc_sox.wait(timeout=2)
+                except Exception:
+                    try:
+                        self.proc_sox.kill()
+                    except Exception:
+                        pass
+
+
+def _looks_like_sentence_end(buffer: str) -> bool:
+    if not buffer:
+        return False
+    # Corta en finales de oración o salto de línea
+    if re.search(r"[\.\?!¡!:\u2026]\s*$", buffer):
+        return True
+    if "\n" in buffer:
+        return True
+    # Evita segmentos demasiado largos
+    if len(buffer) >= 160 and buffer.endswith(" "):
+        return True
+    # Corte suave en comas si el fragmento ya es razonablemente largo
+    if len(buffer) >= 80 and buffer.strip().endswith(","):
+        return True
+    return False
+
+
+def stream_and_speak_from_ollama(messages: list) -> str:
+    print("[Streaming IA] Iniciando stream con Ollama y TTS en frases…")
+    text_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+    full_reply: str = ""
+    # Usar piper-tts directamente sobre una tubería continua para evitar cortes
+    global _piper_voice
+    if _piper_voice is None:
+        from piper.voice import PiperVoice  # type: ignore
+        _piper_voice = PiperVoice.load(PIPER_MODEL, PIPER_CONFIG)
+    print(f"[TTS-Pipeline] Inicializando canal continuo a { _piper_voice.config.sample_rate } Hz")
+    pipeline = AudioPipeline(input_rate=_piper_voice.config.sample_rate)
+
+    def tts_worker() -> None:
+        while True:
+            segment = text_queue.get()
+            try:
+                if segment is None:
+                    return
+                seg = segment.strip()
+                if not seg:
+                    continue
+                print(f"[TTS-Pipeline] Sintetizando segmento ({len(seg)} chars)…")
+                # Sintetizar y escribir directo a la tubería
+                for chunk in _piper_voice.synthesize(seg):
+                    try:
+                        if hasattr(chunk, 'pcm'):
+                            data = chunk.pcm if isinstance(chunk.pcm, (bytes, bytearray)) else getattr(chunk.pcm, 'tobytes', lambda: bytes(chunk.pcm))()
+                        elif hasattr(chunk, 'data'):
+                            data = chunk.data
+                        elif isinstance(chunk, (bytes, bytearray)):
+                            data = chunk
+                        elif hasattr(chunk, 'tobytes'):
+                            data = chunk.tobytes()
+                        else:
+                            data = bytes(chunk)
+                        pipeline.write(data)
+                    except Exception:
+                        continue
+                print("[TTS-Pipeline] Segmento enviado")
+            finally:
+                text_queue.task_done()
+
+    worker_thread = threading.Thread(target=tts_worker, daemon=True)
+    worker_thread.start()
+
+    buffer: str = ""
+    try:
+        if OLLAMA_HOST:
+            client = ollama.Client(host=OLLAMA_HOST)
+            stream = client.chat(
+                model=OLLAMA_MODEL,
+                messages=messages,
+                stream=True,
+            )
+        else:
+            stream = ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=messages,
+                stream=True,
+            )
+
+        for chunk in stream:
+            try:
+                piece = chunk.get("message", {}).get("content", "")
+            except Exception:
+                piece = ""
+            if not piece:
+                continue
+            full_reply += piece
+            buffer += piece
+            # Emitir por frases
+            if _looks_like_sentence_end(buffer):
+                text_queue.put(buffer)
+                buffer = ""
+
+        # Vaciar lo que quede
+        if buffer.strip():
+            text_queue.put(buffer)
+            buffer = ""
+    except Exception as exc:
+        print(f"[Streaming IA] Error durante streaming: {exc}")
+    finally:
+        # Señal de fin
+        text_queue.put(None)
+        text_queue.join()
+        try:
+            worker_thread.join(timeout=0.2)
+        except Exception:
+            pass
+        pipeline.close()
+        print("[TTS-Pipeline] Canal de audio cerrado")
+
+    return full_reply.strip()
 
 
 def create_recognizer() -> vosk.KaldiRecognizer:
@@ -183,8 +667,6 @@ def _validate_piper_files() -> bool:
 def _discover_and_set_piper_voice() -> None:
     """Si los paths actuales no son válidos, intenta detectar cualquier voz válida en voices/."""
     global PIPER_MODEL, PIPER_CONFIG
-    if _validate_piper_files():
-        return
     try:
         if not os.path.isdir(VOICES_DIR):
             return
@@ -222,11 +704,8 @@ def _discover_and_set_piper_voice() -> None:
 def create_wake_recognizer() -> vosk.KaldiRecognizer:
     assert _vosk_model is not None
     grammar = json.dumps([WAKE_WORD])
-    print(f"grammar: {grammar}")
     recognizer = vosk.KaldiRecognizer(_vosk_model, SAMPLE_RATE, grammar)
-    print("Despues de crear el recognizer")
     recognizer.SetWords(False)
-    print("Despues de setear el recognizer")
     return recognizer
 
 
@@ -238,23 +717,36 @@ def wait_for_wake_word() -> None:
         if status:
             pass
         q.put(bytes(indata))
-    with sd.RawInputStream(
-        samplerate=SAMPLE_RATE,
-        blocksize=BLOCKSIZE,
-        dtype="int16",
-        channels=1,
-        callback=callback,
-        device=sd.default.device,
-    ):
 
-        while True:
-            data = q.get()
-            if recognizer.AcceptWaveform(data):
-                res = json.loads(recognizer.Result())
-                txt = res.get("text", "").lower()
-                print(f"txt: {txt}")
-                if txt == WAKE_WORD:
-                    return
+    try:
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCKSIZE,
+            dtype="int16",
+            channels=1,
+            callback=callback,
+            device=sd.default.device,
+        ):
+            print("Escuchando wake word...")
+            while True:
+                try:
+                    data = q.get(timeout=1.0)  # Timeout para evitar bloqueo
+                except:
+                    continue
+
+                if recognizer.AcceptWaveform(data):
+                    res = json.loads(recognizer.Result())
+                    txt = res.get("text", "").lower().strip()
+                    if txt == WAKE_WORD:
+                        print(f"Wake word detectada: '{txt}'")
+                        # Pequeña pausa para evitar interferencia de audio residual
+                        time.sleep(0.5)
+                        return
+    except Exception as exc:
+        print(f"Error en wait_for_wake_word: {exc}")
+        # Reintentar después de un breve delay
+        time.sleep(1.0)
+        return wait_for_wake_word()
 
 
 def listen_command(recognizer: vosk.KaldiRecognizer) -> str:
@@ -312,37 +804,53 @@ def listen_command(recognizer: vosk.KaldiRecognizer) -> str:
 
 
 def main() -> None:
+    _validate_piper_files()
+        
     ensure_paths()
     print("Asistente listo. Di 'asistente' para activar.")
     cooldown_end_ts = 0.0
 
     while True:
         print("[Esperando palabra de activación]")
-        # Evitar re-disparo inmediato
+
+        # Evitar re-disparo inmediato por cooldown
         now = time.time()
         if now < cooldown_end_ts:
             time.sleep(max(0.0, cooldown_end_ts - now))
+
+        # Esperar wake word
         wait_for_wake_word()
-        print("[Wake word] detectada")
-        # Nuevo recognizer para el siguiente enunciado
+        print("[Wake word] detectada - cambiando a modo comando")
+
+        # Crear nuevo recognizer para el comando
         command_recognizer = create_recognizer()
+        print("[Escuchando comando] (habla ahora)")
         command = listen_command(command_recognizer)
-        print(f"command: {command}")
+        print(f"[Comando recibido]: '{command}'")
+
         if not command:
+            print("[No se detectó comando] - volviendo a esperar wake word")
             cooldown_end_ts = time.time() + 1.0
             continue
+
+        # Procesar con IA
+        messages = build_ollama_messages(command)
+        print(f"[Procesando] Enviando a {OLLAMA_MODEL}: '{command[:100]}...'")
+        print(f"[Prompt] Usando prompt del sistema: {OLLAMA_PROMPT[:100]}...")
+
         try:
-            response = ollama.chat(
-                model=OLLAMA_MODEL,
-                messages=[{"role": "user", "content": command}],
-            )
-            reply = response["message"]["content"].strip()
+            # Streaming: genera y habla por frases
+            reply = stream_and_speak_from_ollama(messages)
         except Exception as exc:
-            reply = f"Hubo un error consultando el modelo: {exc}"
-        print(f"[IA] {reply}")
-        speak(reply)
-        # Pequeño cooldown para evitar re-disparos con ruido residual
-        cooldown_end_ts = time.time() + 1.5
+            error = f"Hubo un error consultando el modelo: {exc}"
+            print(f"[Error IA]: '{error}'")
+            reply = error
+
+        print(f"[Respuesta IA]: '{reply[:300]}...'")  # Primeros 300 chars
+
+        # Cooldown antes de volver a esperar wake word
+        cooldown_end_ts = time.time() + 2.0
+        print("[Cooldown] Listo para nueva activación en 2 segundos")
 
 
 if __name__ == "__main__":

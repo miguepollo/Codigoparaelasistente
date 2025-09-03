@@ -46,7 +46,7 @@ def main() -> int:
             break
 
     if not (onnx_ok and json_ok):
-        print("No se pudo descargar la voz es_ES-sharvard-low. Descárgala manualmente.")
+        print("No se pudo descargar la voz es_ES-sharvard-mid. Descárgala manualmente.")
         return 1
 
     print("Voz descargada correctamente.")

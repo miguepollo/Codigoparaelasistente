@@ -14,5 +14,8 @@ else
   . .venv/bin/activate
 fi
 
+# Dispositivo ALSA por defecto para aplay (puede ser sobrescrito vía entorno)
+export APLAY_DEVICE="${APLAY_DEVICE:-hw:2,0}"
+
 python assistant.py
 
