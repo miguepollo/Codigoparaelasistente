@@ -1,6 +1,5 @@
 ## Asistente IA (Vosk + Piper + Ollama)
 
-![license](https://img.shields.io/github/license/miguepollo/Codigoparaelasistente?style=for-the-badge)
 ![Last commit](https://img.shields.io/github/last-commit/miguepollo/Codigoparaelasistente?style=for-the-badge)
 ![activity](https://img.shields.io/github/commit-activity/m/miguepollo/Codigoparaelasistente?style=for-the-badge)
 ![github stars](https://img.shields.io/github/stars/miguepollo/Codigoparaelasistente?style=for-the-badge)
