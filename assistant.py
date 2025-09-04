@@ -8,6 +8,7 @@ import re
 import io
 import wave
 import shutil
+import math
 from typing import Optional
 
 import numpy as np
@@ -34,15 +35,43 @@ if env_config:
 sd.default.device = 'rockchip,es8388'
 SAMPLE_RATE = 16000
 BLOCKSIZE = 8000
-WAKE_WORD = "asistente"
-SILENCE_THRESHOLD = 600  # RMS ~ energía. Ajustar si hace falta
-SILENCE_MS = 1300  # fin por silencio
+WAKE_WORD = "hola"
+SILENCE_THRESHOLD = 2000  # RMS ~ energía. Ajustar si hace falta
+SILENCE_MS = 2000  # fin por silencio
 MAX_COMMAND_SECS = 12
-OLLAMA_MODEL = "gemma3:270m"
+OLLAMA_MODEL = "llama3.2:1b"
 # Permite configurar el endpoint de Ollama, p.ej.: OLLAMA_HOST="http://127.0.0.1:11434"
 OLLAMA_HOST = "http://127.0.0.1:11434"
-# Prompt personalizado para el asistente (puedes modificarlo o usar variable de entorno)
-OLLAMA_PROMPT = os.getenv("OLLAMA_PROMPT", """You are a voice assistant called Kubik. Always respond with plain text. Your response can only contain 100 words or less. Always respond in Spanish.""")
+# Prompt del sistema. Busca respuestas directas, sin saludos ni autorreferencias
+OLLAMA_PROMPT = os.getenv(
+    "OLLAMA_PROMPT",
+    (
+        "Eres un asistente llamado Kubik. Responde SIEMPRE en español, de forma directa y concisa. "
+        "PROHIBIDO saludar o presentarte (no digas 'hola', 'soy Kubik', etc.). A menos que te pregunten por tu nombre, entonces responde 'Soy Kubik, tu asistente virtual.' "
+        "Cuando te pregunten 'quién/qué/cuándo/dónde/por qué/cómo', responde con 2-3 frases informativas y nada más. "
+        "Usa tono neutro, sin muletillas ni disculpas."
+    ),
+)
+
+# Opciones de inferencia para Ollama (se puede sobrescribir con OLLAMA_OPTIONS JSON)
+def _load_ollama_options() -> dict:
+    raw = os.getenv("OLLAMA_OPTIONS", "")
+    if raw.strip():
+        try:
+            opts = json.loads(raw)
+            if isinstance(opts, dict):
+                return opts
+        except Exception:
+            pass
+    # Valores por defecto sobrios para respuestas más precisas y sin desvíos
+    return {
+        "temperature": 0.5,
+        "top_p": 0.9,
+        "repeat_penalty": 1.05,
+        "num_predict": 256,
+    }
+
+OLLAMA_OPTIONS = _load_ollama_options()
 
 def build_ollama_messages(user_message: str) -> list:
     """Construye los mensajes para enviar a Ollama incluyendo el prompt del sistema."""
@@ -396,6 +425,53 @@ def speak(text: str) -> None:
         print(f"[TTS] Error en fallback Piper-tts (streaming): {exc}")
 
 
+def _generate_beep_wav_bytes(frequency_hz: int, duration_ms: int, volume: float = 0.25) -> bytes:
+    sr = 48000
+    channels = 2
+    total_samples = max(1, int(sr * duration_ms / 1000.0))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        two_pi_f_over_sr = 2.0 * math.pi * float(frequency_hz) / float(sr)
+        peak = int(32767 * max(0.0, min(1.0, volume)))
+        # Pequeño fade de entrada/salida para evitar clics
+        fade_samples = max(1, int(0.004 * sr))
+        for n in range(total_samples):
+            sample = int(math.sin(two_pi_f_over_sr * n) * peak)
+            if n < fade_samples:
+                sample = int(sample * (n / fade_samples))
+            tail = total_samples - 1 - n
+            if tail < fade_samples:
+                sample = int(sample * (tail / fade_samples))
+            # Estéreo: duplicar muestra
+            wf.writeframesraw(sample.to_bytes(2, byteorder="little", signed=True) * channels)
+    return buf.getvalue()
+
+
+def play_earcon(kind: str) -> None:
+    try:
+        if kind == "start_listen":
+            wav_bytes = _generate_beep_wav_bytes(1200, 250, volume=0.55)
+        elif kind == "end_listen":
+            wav_bytes = _generate_beep_wav_bytes(1200, 180, volume=0.55)
+        else:
+            wav_bytes = _generate_beep_wav_bytes(1200, 200, volume=0.55)
+
+        aplay_cmd = ["aplay", "-q", "-t", "wav", "-"]
+        dev = os.getenv("APLAY_DEVICE")
+        if dev:
+            aplay_cmd = ["aplay", "-q", "-D", dev, "-t", "wav", "-"]
+        p = subprocess.run(aplay_cmd, input=wav_bytes, capture_output=True)
+        if p.returncode != 0 and dev and dev.startswith("hw:"):
+            # Reintentar con 'default' si hw falla
+            subprocess.run(["aplay", "-q", "-D", "default", "-t", "wav", "-"], input=wav_bytes)
+    except Exception:
+        # No romper el flujo por un beep
+        pass
+
+
 class AudioPipeline:
     """Tubería de audio persistente para enviar PCM16 mono a aplay,
     opcionalmente pasando por sox para convertir a parámetros que el hw acepte.
@@ -413,6 +489,7 @@ class AudioPipeline:
         have_sox = shutil.which("sox") is not None
         # Preferir conversión con sox si el destino es hw:*
         if device.startswith("hw:") and have_sox:
+            print(f"[TTS-Pipeline] Usando sox → aplay (hw: conversión 48k/16bit/2ch) en {device}")
             sox_cmd = [
                 "sox",
                 "-t", "raw",
@@ -446,6 +523,8 @@ class AudioPipeline:
             )
         else:
             # Directo a aplay en RAW (usa plughw si así está en APLAY_DEVICE)
+            target = device if device else "(por defecto)"
+            print(f"[TTS-Pipeline] Enviando RAW directo a aplay en {target} @ {self.input_rate}Hz mono S16_LE")
             play_cmd = [
                 "aplay", "-q",
                 "-t", "raw",
@@ -502,21 +581,16 @@ class AudioPipeline:
                     pass
         finally:
             if self.proc_play is not None:
+                # Esperar a que termine de reproducir todo el audio
                 try:
-                    self.proc_play.wait(timeout=2)
+                    self.proc_play.wait()
                 except Exception:
-                    try:
-                        self.proc_play.kill()
-                    except Exception:
-                        pass
+                    pass
             if self.proc_sox is not None:
                 try:
-                    self.proc_sox.wait(timeout=2)
+                    self.proc_sox.wait()
                 except Exception:
-                    try:
-                        self.proc_sox.kill()
-                    except Exception:
-                        pass
+                    pass
 
 
 def _looks_like_sentence_end(buffer: str) -> bool:
@@ -528,10 +602,10 @@ def _looks_like_sentence_end(buffer: str) -> bool:
     if "\n" in buffer:
         return True
     # Evita segmentos demasiado largos
-    if len(buffer) >= 160 and buffer.endswith(" "):
+    if len(buffer) >= 200 and buffer.endswith(" "):
         return True
-    # Corte suave en comas si el fragmento ya es razonablemente largo
-    if len(buffer) >= 80 and buffer.strip().endswith(","):
+    # Evitar cortes agresivos en coma; requerir más longitud
+    if len(buffer) >= 140 and buffer.strip().endswith(","):
         return True
     return False
 
@@ -558,23 +632,74 @@ def stream_and_speak_from_ollama(messages: list) -> str:
                 if not seg:
                     continue
                 print(f"[TTS-Pipeline] Sintetizando segmento ({len(seg)} chars)…")
-                # Sintetizar y escribir directo a la tubería
-                for chunk in _piper_voice.synthesize(seg):
+                # 1) Intento: extraer PCM directamente del iterador de piper-tts
+                def to_bytes(obj) -> bytes:
+                    if obj is None:
+                        return b""
+                    if isinstance(obj, (bytes, bytearray)):
+                        return bytes(obj)
                     try:
-                        if hasattr(chunk, 'pcm'):
-                            data = chunk.pcm if isinstance(chunk.pcm, (bytes, bytearray)) else getattr(chunk.pcm, 'tobytes', lambda: bytes(chunk.pcm))()
-                        elif hasattr(chunk, 'data'):
-                            data = chunk.data
-                        elif isinstance(chunk, (bytes, bytearray)):
-                            data = chunk
-                        elif hasattr(chunk, 'tobytes'):
-                            data = chunk.tobytes()
-                        else:
-                            data = bytes(chunk)
-                        pipeline.write(data)
+                        return memoryview(obj).tobytes()  # type: ignore[arg-type]
                     except Exception:
-                        continue
-                print("[TTS-Pipeline] Segmento enviado")
+                        pass
+                    if hasattr(obj, 'tobytes'):
+                        try:
+                            return obj.tobytes()
+                        except Exception:
+                            pass
+                    if hasattr(obj, 'astype'):
+                        try:
+                            return obj.astype('<i2').tobytes()
+                        except Exception:
+                            pass
+                    try:
+                        return bytes(obj)
+                    except Exception:
+                        return b""
+
+                pcm_bytes_total = 0
+                first_chunk_info = None
+                try:
+                    for idx, chunk in enumerate(_piper_voice.synthesize(seg)):
+                        try:
+                            data = b""
+                            if hasattr(chunk, 'pcm'):
+                                data = to_bytes(getattr(chunk, 'pcm'))
+                            elif hasattr(chunk, 'data'):
+                                data = to_bytes(getattr(chunk, 'data'))
+                            else:
+                                data = to_bytes(chunk)
+                            if idx < 3 and first_chunk_info is None and data == b"":
+                                first_chunk_info = f"tipo={type(chunk)} attrs={dir(chunk)[:6]}"
+                            if data:
+                                pcm_bytes_total += len(data)
+                                pipeline.write(data)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                # 2) Si no llegó PCM, usar CLI de Piper y extraer frames WAV
+                used_cli = False
+                if pcm_bytes_total == 0:
+                    try:
+                        cmd = ["piper", "-m", PIPER_MODEL, "-c", PIPER_CONFIG, "-f", "-"]
+                        proc = subprocess.run(cmd, input=(seg + "\n").encode('utf-8'), capture_output=True)
+                        used_cli = True
+                        wav_bytes = proc.stdout
+                        if wav_bytes:
+                            rdr = wave.open(io.BytesIO(wav_bytes), 'rb')
+                            frames = rdr.readframes(rdr.getnframes())
+                            rdr.close()
+                            if frames:
+                                pipeline.write(frames)
+                                pcm_bytes_total = len(frames)
+                    except Exception:
+                        pcm_bytes_total = 0
+
+                if first_chunk_info and pcm_bytes_total == 0:
+                    print(f"[TTS-Pipeline] Diagnóstico primer chunk vacío: {first_chunk_info}")
+                print(f"[TTS-Pipeline] Segmento enviado ({pcm_bytes_total} bytes){' [cli]' if used_cli else ''}")
             finally:
                 text_queue.task_done()
 
@@ -589,12 +714,14 @@ def stream_and_speak_from_ollama(messages: list) -> str:
                 model=OLLAMA_MODEL,
                 messages=messages,
                 stream=True,
+                options=OLLAMA_OPTIONS,
             )
         else:
             stream = ollama.chat(
                 model=OLLAMA_MODEL,
                 messages=messages,
                 stream=True,
+                options=OLLAMA_OPTIONS,
             )
 
         for chunk in stream:
@@ -740,7 +867,7 @@ def wait_for_wake_word() -> None:
                     if txt == WAKE_WORD:
                         print(f"Wake word detectada: '{txt}'")
                         # Pequeña pausa para evitar interferencia de audio residual
-                        time.sleep(0.5)
+                        time.sleep(0.25)
                         return
     except Exception as exc:
         print(f"Error en wait_for_wake_word: {exc}")
@@ -762,6 +889,12 @@ def listen_command(recognizer: vosk.KaldiRecognizer) -> str:
         if _rms_int16(audio) > SILENCE_THRESHOLD:
             last_voice_ts = time.time()
         q.put(bytes(indata))
+
+    # Beep de inicio de escucha
+    try:
+        play_earcon("start_listen")
+    except Exception:
+        pass
 
     with sd.RawInputStream(
         samplerate=SAMPLE_RATE,
@@ -801,6 +934,11 @@ def listen_command(recognizer: vosk.KaldiRecognizer) -> str:
             else:
                 # opcional: usar parcial para feedback
                 pass
+    # Beep de fin de escucha
+    try:
+        play_earcon("end_listen")
+    except Exception:
+        pass
 
 
 def main() -> None:
