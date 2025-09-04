@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import queue
@@ -9,7 +10,12 @@ import io
 import wave
 import shutil
 import math
-from typing import Optional
+from typing import Optional, Tuple, Literal
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import requests
+from flask import Flask, request, redirect, url_for, render_template_string
 
 import numpy as np
 import sounddevice as sd
@@ -22,6 +28,7 @@ VOSK_MODEL_DIR = os.path.join(BASE_DIR, "models", "vosk")
 PIPER_MODEL = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-medium.onnx")
 PIPER_CONFIG = os.path.join(BASE_DIR, "voices", "es_ES-sharvard-medium.onnx.json")
 VOICES_DIR = os.path.join(BASE_DIR, "voices")
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 # Permitir override por variables de entorno
 env_model = os.getenv("PIPER_MODEL")
 env_config = os.getenv("PIPER_CONFIG")
@@ -83,6 +90,338 @@ def build_ollama_messages(user_message: str) -> list:
 
 _piper_voice = None  # Lazy init para fallback Python
 _vosk_model: Optional[vosk.Model] = None  # Reutilizar modelo en memoria
+_config: dict = {}
+
+IntentType = Literal["weather", "time", "other"]
+
+
+def load_config() -> dict:
+    """Carga configuración desde config.json y variables de entorno.
+    Campos: owm_api_key, city, lat, lon, timezone (IANA).
+    """
+    cfg = {
+        "owm_api_key": os.getenv("OWM_API_KEY", ""),
+        "city": os.getenv("OWM_CITY", ""),
+        "lat": os.getenv("OWM_LAT", ""),
+        "lon": os.getenv("OWM_LON", ""),
+        "timezone": os.getenv("TIMEZONE", "Europe/Madrid"),
+    }
+    try:
+        if os.path.isfile(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+                disk = json.load(fh) or {}
+                if isinstance(disk, dict):
+                    cfg.update({k: (disk.get(k) or cfg.get(k)) for k in cfg.keys()})
+    except Exception:
+        pass
+    # Normalizar espacios y tipos
+    for k in ["owm_api_key", "city", "timezone"]:
+        if isinstance(cfg.get(k), str):
+            cfg[k] = cfg[k].strip()
+    for k in ["lat", "lon"]:
+        v = cfg.get(k)
+        if isinstance(v, str):
+            cfg[k] = v.strip()
+    return cfg
+
+
+def get_config() -> dict:
+    global _config
+    if not _config:
+        _config = load_config()
+    return _config
+
+
+def save_config(new_cfg: dict) -> None:
+    """Guarda configuración en disco de forma atómica y actualiza memoria."""
+    tmp_path = CONFIG_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(new_cfg, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, CONFIG_PATH)
+    # Actualizar config en memoria
+    global _config
+    _config = new_cfg.copy()
+
+
+def detect_intent(text: str) -> Tuple[IntentType, dict]:
+    """[LEGADO] Detección por palabras clave (fallback)."""
+    t = (text or "").lower()
+    t = re.sub(r"\s+", " ", t).strip()
+    extras: dict = {}
+    if re.search(r"\b(hora|qué hora|que hora|hora actual)\b", t):
+        return "time", extras
+    if re.search(r"\b(tiempo|clima|temperatura|pron[oó]stico|lluev|viento|humedad|nubes?)\b", t):
+        if re.search(r"ma[ñn]ana|mañana", t):
+            extras["when"] = "tomorrow"
+        elif re.search(r"hoy|ahora|actual", t):
+            extras["when"] = "now"
+        return "weather", extras
+    return "other", extras
+
+
+def classify_intent_via_llm(text: str) -> Tuple[IntentType, dict]:
+    """Pide a la IA que clasifique la intención y el marco temporal.
+    Devuelve (intent, extras) donde intent ∈ {weather,time,other} y extras puede incluir 'when'.
+    """
+    system = (
+        "Eres un clasificador de intenciones para un asistente de voz. "
+        "Dado el texto del usuario en español, responde SOLO un JSON en una sola línea con esta forma exacta: "
+        "{\"intent\":\"weather|time|other\",\"when\":\"now|today|tomorrow|none\"}. "
+        "Elige intent=weather si pregunta por clima/tiempo/temperatura/lluvia/viento/humedad/nubes/pronóstico. "
+        "Elige intent=time si pregunta la hora. Si no aplica, other. "
+        "'when': now o today si es sobre ahora/hoy, tomorrow si menciona mañana, si no se deduce usa none. "
+        "No añadas texto adicional ni explicaciones."
+    )
+    user = text.strip()
+    resp = _ollama_chat([{"role": "system", "content": system}, {"role": "user", "content": user}])
+    intent: IntentType = "other"
+    extras: dict = {}
+    # Intentar parsear JSON
+    try:
+        data = json.loads(resp)
+        val = str(data.get("intent", "other")).strip().lower()
+        if val in {"weather", "time", "other"}:
+            intent = val  # type: ignore[assignment]
+        when = str(data.get("when", "none")).strip().lower()
+        if when in {"now", "today", "tomorrow", "none"}:
+            if when == "today":
+                when = "now"
+            if when != "none":
+                extras["when"] = when
+    except Exception:
+        # Fallback: si el modelo devolvió texto plano
+        low = (resp or "").strip().lower()
+        if "weather" in low or "clima" in low or "tiempo" in low:
+            intent = "weather"  # type: ignore[assignment]
+        elif "time" in low or "hora" in low:
+            intent = "time"  # type: ignore[assignment]
+    # Si sigue en other, usar heurística básica como último recurso
+    if intent == "other":
+        intent, heur = detect_intent(text)
+        extras.update(heur)
+    return intent, extras
+
+
+def _ollama_chat(messages: list) -> str:
+    """Llama a Ollama de forma no streaming y devuelve el texto completo."""
+    try:
+        if OLLAMA_HOST:
+            client = ollama.Client(host=OLLAMA_HOST)
+            resp = client.chat(model=OLLAMA_MODEL, messages=messages, options=OLLAMA_OPTIONS)
+        else:
+            resp = ollama.chat(model=OLLAMA_MODEL, messages=messages, options=OLLAMA_OPTIONS)
+        out = (resp or {}).get("message", {}).get("content", "")
+        return (out or "").strip()
+    except Exception as exc:
+        return f"Error consultando el modelo: {exc}"
+
+
+def _summarize_weather_json(json_payload: dict, location_label: str) -> str:
+    """Construye prompt para resumir JSON meteorológico en 2-3 frases claras."""
+    system = (
+        "Eres un asistente metereológico. Resume en 2-3 frases, en español, de forma concreta, "
+        "sin adornos ni saludos. Incluye temperatura, sensación térmica, estado general, y si hay lluvia/viento relevante. No añadas ninguna otra información. No pongas asteriscos. No digas 24Cº solo di 24 grados."
+    )
+    user = (
+        "Resume el siguiente JSON de clima actual para el usuario. Usa unidades SI y 24h. "
+        f"Ubicación: {location_label}. JSON:\n" + json.dumps(json_payload, ensure_ascii=False)
+    )
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    return _ollama_chat(messages)
+
+
+def _summarize_time_json(json_payload: dict) -> str:
+    """Construye prompt para resumir la hora local en 1 frase."""
+    system = (
+        "Eres un asistente de hora. Responde en una sola frase clara, en español, sin saludos." 
+        "Usa formato 24h con ceros y menciona la zona horaria abreviada."
+    )
+    user = "Resume brevemente estos datos de hora local en una frase: " + json.dumps(json_payload, ensure_ascii=False)
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    return _ollama_chat(messages)
+
+
+def _fetch_openweather(cfg: dict, when: str = "now") -> Tuple[Optional[dict], Optional[str]]:
+    """Obtiene datos de OpenWeatherMap para clima actual. Devuelve (json, error)."""
+    api_key = (cfg.get("owm_api_key") or "").strip()
+    lat = (cfg.get("lat") or "").strip()
+    lon = (cfg.get("lon") or "").strip()
+    city = (cfg.get("city") or "").strip()
+    if not api_key:
+        return None, "Falta la API key de OpenWeather. Configúrala en la interfaz web."
+    params = {"appid": api_key, "units": "metric", "lang": "es"}
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    if lat and lon:
+        params.update({"lat": lat, "lon": lon})
+        location_label = f"lat {lat}, lon {lon}"
+    elif city:
+        params.update({"q": city})
+        location_label = city
+    else:
+        return None, "Falta ubicación (ciudad o lat/lon). Configúrala en la interfaz web."
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return None, f"OpenWeather devolvió {r.status_code}: {r.text[:200]}"
+        data = r.json()
+        data["_location_label"] = location_label
+        return data, None
+    except Exception as exc:
+        return None, f"Error consultando OpenWeather: {exc}"
+
+
+def handle_weather_command(original_text: str, when: Optional[str] = None) -> str:
+    cfg = get_config()
+    if not when:
+        when = detect_intent(original_text)[1].get("when", "now")
+    data, err = _fetch_openweather(cfg, when=when)
+    if err:
+        return err
+    assert data is not None
+    location_label = data.pop("_location_label", cfg.get("city") or "")
+    summary = _summarize_weather_json(data, location_label or "")
+    return summary or "No pude generar el resumen del clima."
+
+
+def handle_time_command() -> str:
+    cfg = get_config()
+    tz_name = cfg.get("timezone") or "Europe/Madrid"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Europe/Madrid")
+        tz_name = "Europe/Madrid"
+    now = datetime.now(tz)
+    offset_total_seconds = tz.utcoffset(now).total_seconds() if tz.utcoffset(now) else 0
+    offset_hours = int(offset_total_seconds // 3600)
+    offset_minutes = int((abs(offset_total_seconds) % 3600) // 60)
+    sign = "+" if offset_total_seconds >= 0 else "-"
+    offset_str = f"UTC{sign}{abs(offset_hours):02d}:{offset_minutes:02d}"
+    payload = {
+        "timezone": tz_name,
+        "iso": now.isoformat(),
+        "time_24h": now.strftime("%H:%M"),
+        "date": now.strftime("%Y-%m-%d"),
+        "weekday": now.strftime("%A"),
+        "utc_offset": offset_str,
+    }
+    summary = _summarize_time_json(payload)
+    return summary or f"Son las {payload['time_24h']} ({payload['timezone']})."
+
+
+# =====================
+# Interfaz Web (Flask)
+# =====================
+
+_flask_app: Optional[Flask] = None
+
+_TEMPLATE = """
+<!doctype html>
+<html lang=\"es\">
+  <head>
+    <meta charset=\"utf-8\">
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+    <title>Config Asistente</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial; max-width: 880px; margin: 20px auto; padding: 0 16px; }
+      .card { border: 1px solid #e3e3e3; border-radius: 10px; padding: 18px; margin: 12px 0; }
+      label { display: block; font-weight: 600; margin-top: 10px; }
+      input[type=text], input[type=password] { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }
+      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      .actions { margin-top: 16px; }
+      button { background: #0d6efd; color: white; border: none; border-radius: 8px; padding: 10px 14px; cursor: pointer; }
+      .note { color: #555; font-size: 0.95em; }
+    </style>
+  </head>
+  <body>
+    <h2>Configuración del asistente</h2>
+    <form method=\"post\" action=\"{{ url_for('cfg_save') }}\">
+      <div class=\"card\">
+        <h3>OpenWeatherMap</h3>
+        <label>API Key</label>
+        <input type=\"password\" name=\"owm_api_key\" value=\"{{ cfg.get('owm_api_key','') }}\" placeholder=\"tu_api_key\" />
+        <div class=\"row\">
+          <div>
+            <label>Ciudad</label>
+            <input type=\"text\" name=\"city\" value=\"{{ cfg.get('city','') }}\" placeholder=\"Madrid\" />
+            <div class=\"note\">Puedes dejar vacío si usas lat/lon</div>
+          </div>
+          <div></div>
+        </div>
+        <div class=\"row\">
+          <div>
+            <label>Latitud</label>
+            <input type=\"text\" name=\"lat\" value=\"{{ cfg.get('lat','') }}\" placeholder=\"40.4168\" />
+          </div>
+          <div>
+            <label>Longitud</label>
+            <input type=\"text\" name=\"lon\" value=\"{{ cfg.get('lon','') }}\" placeholder=\"-3.7038\" />
+          </div>
+        </div>
+      </div>
+
+      <div class=\"card\">
+        <h3>Zona horaria</h3>
+        <label>Timezone IANA</label>
+        <input type=\"text\" name=\"timezone\" value=\"{{ cfg.get('timezone','Europe/Madrid') }}\" placeholder=\"Europe/Madrid\" />
+        <div class=\"note\">Ejemplos: Europe/Madrid, America/Mexico_City, America/Bogota</div>
+      </div>
+
+      <div class=\"actions\">
+        <button type=\"submit\">Guardar</button>
+      </div>
+    </form>
+    <p class=\"note\">Tras guardar, el asistente se reiniciará.</p>
+  </body>
+  </html>
+"""
+
+
+def _schedule_restart(delay_sec: float = 0.4) -> None:
+    def _do_restart() -> None:
+        try:
+            time.sleep(delay_sec)
+            python = sys.executable or "python3"
+            os.execv(python, [python, os.path.abspath(__file__)])
+        except Exception:
+            os._exit(0)
+    threading.Thread(target=_do_restart, daemon=True).start()
+
+
+def _create_flask_app() -> Flask:
+    app = Flask(__name__)
+
+    @app.get("/")
+    def cfg_index():
+        return render_template_string(_TEMPLATE, cfg=load_config())
+
+    @app.post("/save")
+    def cfg_save():
+        cfg = load_config()
+        for key in ["owm_api_key", "city", "lat", "lon", "timezone"]:
+            val = request.form.get(key, "")
+            if isinstance(val, str):
+                val = val.strip()
+            cfg[key] = val
+        save_config(cfg)
+        # Programar reinicio del proceso tras responder
+        _schedule_restart(0.4)
+        return redirect(url_for("cfg_index"))
+
+    return app
+
+
+def start_config_server() -> None:
+    global _flask_app
+    if _flask_app is not None:
+        return
+    _flask_app = _create_flask_app()
+    def _run():
+        try:
+            _flask_app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False, threaded=True)
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def ensure_paths() -> None:
@@ -943,8 +1282,13 @@ def listen_command(recognizer: vosk.KaldiRecognizer) -> str:
 
 def main() -> None:
     _validate_piper_files()
-        
+    
     ensure_paths()
+    # Cargar config de usuario (OpenWeather/ubicación/zone)
+    global _config
+    _config = load_config()
+    # Lanzar siempre la UI de configuración en segundo plano
+    start_config_server()
     print("Asistente listo. Di 'asistente' para activar.")
     cooldown_end_ts = 0.0
 
@@ -971,18 +1315,29 @@ def main() -> None:
             cooldown_end_ts = time.time() + 1.0
             continue
 
-        # Procesar con IA
-        messages = build_ollama_messages(command)
-        print(f"[Procesando] Enviando a {OLLAMA_MODEL}: '{command[:100]}...'")
-        print(f"[Prompt] Usando prompt del sistema: {OLLAMA_PROMPT[:100]}...")
-
-        try:
-            # Streaming: genera y habla por frases
-            reply = stream_and_speak_from_ollama(messages)
-        except Exception as exc:
-            error = f"Hubo un error consultando el modelo: {exc}"
-            print(f"[Error IA]: '{error}'")
-            reply = error
+        # Detección de intención con IA (fallback a heurística si falla)
+        intent, _extras = classify_intent_via_llm(command)
+        if intent == "weather":
+            print("[Intent] Consulta de clima detectada")
+            reply = handle_weather_command(command, when=_extras.get("when"))
+            print(f"[IA resumen clima]: '{reply[:200]}...'")
+            speak(reply)
+        elif intent == "time":
+            print("[Intent] Consulta de hora detectada")
+            reply = handle_time_command()
+            print(f"[IA resumen hora]: '{reply[:200]}...'")
+            speak(reply)
+        else:
+            # Procesar con IA por defecto (streaming con síntesis por frases)
+            messages = build_ollama_messages(command)
+            print(f"[Procesando] Enviando a {OLLAMA_MODEL}: '{command[:100]}...'")
+            print(f"[Prompt] Usando prompt del sistema: {OLLAMA_PROMPT[:100]}...")
+            try:
+                reply = stream_and_speak_from_ollama(messages)
+            except Exception as exc:
+                error = f"Hubo un error consultando el modelo: {exc}"
+                print(f"[Error IA]: '{error}'")
+                reply = error
 
         print(f"[Respuesta IA]: '{reply[:300]}...'")  # Primeros 300 chars
 

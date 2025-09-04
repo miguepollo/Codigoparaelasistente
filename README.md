@@ -147,3 +147,30 @@ Los logs muestran claramente cada paso del proceso para facilitar el debugging.
 A @rhasspy por su proyecto  [PiperTTS](https://github.com/OHF-Voice/piper1-gpl) muchas gracias!!!
 
 A @alphacep por su speech-to-text [Vosk](https://github.com/alphacep/vosk-api) me ha servido de mucha utilidad vosk y sobre todo los ejemplos :D !!!
+
+## Configuración de clima y hora
+
+- La app lee `config.json` (en la raíz) o variables de entorno para:
+  - `owm_api_key`: clave de OpenWeatherMap
+  - `city`: ciudad (alternativa a `lat`/`lon`)
+  - `lat`, `lon`: coordenadas en string
+  - `timezone`: zona IANA (ej. `Europe/Madrid`)
+
+### Interfaz web de configuración
+
+Arranca la UI:
+```bash
+source .venv/bin/activate
+python config_server.py
+```
+
+Acceso:
+- Local: `http://127.0.0.1:5000`
+- Desde la red local: `http://IP_DE_TU_MAQUINA:5000` (ej. `http://192.168.1.50:5000`)
+
+Rellena tu API key, ubicación y zona horaria. Guarda y reinicia el asistente si está corriendo.
+
+### Intenciones soportadas
+
+- "qué tiempo hace", "clima", "temperatura", "llueve", "pronóstico": consulta OpenWeather actual y la IA resume. No habla hasta tener el resumen.
+- "qué hora es", "hora actual": calcula la hora local con la `timezone` y la IA resume en una frase. No habla hasta tener el resumen.

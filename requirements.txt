@@ -5,3 +5,7 @@ ollama==0.5.3
 piper-tts==1.3.0
 onnxruntime==1.22.1
 
+# Configuración web y HTTP
+Flask==3.0.3
+requests==2.32.3
+
