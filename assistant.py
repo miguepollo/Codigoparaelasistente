@@ -10,6 +10,7 @@ import io
 import wave
 import shutil
 import math
+import zipfile
 from typing import Optional, Tuple, Literal
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -37,6 +38,16 @@ if env_model:
 if env_config:
     PIPER_CONFIG = env_config
 
+# URL por defecto del modelo grande de Vosk (español)
+VOSK_ES_MODEL_URL = os.getenv(
+    "VOSK_ES_MODEL_URL",
+    "https://alphacephei.com/vosk/models/vosk-model-es-0.42.zip",
+)
+# Permitir override de ruta del modelo Vosk
+env_vosk_dir = os.getenv("VOSK_MODEL_DIR")
+if env_vosk_dir:
+    VOSK_MODEL_DIR = env_vosk_dir
+
 
 # Configuración de audio basada en ejemplo probado
 sd.default.device = 'rockchip,es8388'
@@ -46,9 +57,9 @@ WAKE_WORD = "hola"
 SILENCE_THRESHOLD = 2000  # RMS ~ energía. Ajustar si hace falta
 SILENCE_MS = 2000  # fin por silencio
 MAX_COMMAND_SECS = 12
-OLLAMA_MODEL = "llama3.2:1b"
+OLLAMA_MODEL = "llama3.2:3b"
 # Permite configurar el endpoint de Ollama, p.ej.: OLLAMA_HOST="http://127.0.0.1:11434"
-OLLAMA_HOST = "http://127.0.0.1:11434"
+OLLAMA_HOST = "http://192.168.1.165:11434"
 # Prompt del sistema. Busca respuestas directas, sin saludos ni autorreferencias
 OLLAMA_PROMPT = os.getenv(
     "OLLAMA_PROMPT",
@@ -167,7 +178,7 @@ def classify_intent_via_llm(text: str) -> Tuple[IntentType, dict]:
         "Eres un clasificador de intenciones para un asistente de voz. "
         "Dado el texto del usuario en español, responde SOLO un JSON en una sola línea con esta forma exacta: "
         "{\"intent\":\"weather|time|other\",\"when\":\"now|today|tomorrow|none\"}. "
-        "Elige intent=weather si pregunta por clima/tiempo/temperatura/lluvia/viento/humedad/nubes/pronóstico. "
+        "Elige intent=weather si pregunta por clima/tiempo/temperatura/lluvia/viento/humedad/nubes/pronóstico. Si te dicen que tiempo hace ahora o similares es intent=weather. "
         "Elige intent=time si pregunta la hora. Si no aplica, other. "
         "'when': now o today si es sobre ahora/hoy, tomorrow si menciona mañana, si no se deduce usa none. "
         "No añadas texto adicional ni explicaciones."
@@ -220,7 +231,7 @@ def _summarize_weather_json(json_payload: dict, location_label: str) -> str:
     """Construye prompt para resumir JSON meteorológico en 2-3 frases claras."""
     system = (
         "Eres un asistente metereológico. Resume en 2-3 frases, en español, de forma concreta, "
-        "sin adornos ni saludos. Incluye temperatura, sensación térmica, estado general, y si hay lluvia/viento relevante. No añadas ninguna otra información. No pongas asteriscos. No digas 24Cº solo di 24 grados."
+        "sin adornos ni saludos. Incluye temperatura, sensación térmica, estado general, y si hay lluvia/viento relevante. No añadas ninguna otra información. No pongas asteriscos. No digas 24Cº solo di 24 grados. Y no digas M/S solo di metros por segundo."
     )
     user = (
         "Resume el siguiente JSON de clima actual para el usuario. Usa unidades SI y 24h. "
@@ -424,9 +435,73 @@ def start_config_server() -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _download_and_setup_vosk_model() -> None:
+    """Descarga y prepara el modelo de Vosk en español si no existe.
+    Descarga el zip al directorio models/, lo descomprime y lo mueve a models/vosk.
+    Respeta VOSK_MODEL_DIR si apunta a otra ubicación.
+    """
+    try:
+        models_root = os.path.join(BASE_DIR, "models")
+        os.makedirs(models_root, exist_ok=True)
+        zip_path = os.path.join(models_root, "vosk-model-es.zip")
+        url = VOSK_ES_MODEL_URL
+        print(f"[VOSK] Descargando modelo desde {url} ...")
+        with requests.get(url, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(zip_path, "wb") as fh:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+        print(f"[VOSK] Descomprimiendo {zip_path} ...")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(models_root)
+        # Detectar carpeta extraída (p.ej., vosk-model-es-0.42)
+        extracted_dir = None
+        for name in os.listdir(models_root):
+            p = os.path.join(models_root, name)
+            if os.path.isdir(p) and name.startswith("vosk-model-") and "-es" in name:
+                extracted_dir = p
+                break
+        # Determinar destino
+        dest_dir = VOSK_MODEL_DIR
+        os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
+        if extracted_dir and extracted_dir != dest_dir:
+            # Si ya existe destino, no sobrescribir; en su lugar, usar destino existente
+            if not os.path.isdir(dest_dir):
+                shutil.move(extracted_dir, dest_dir)
+        print(f"[VOSK] Modelo listo en {dest_dir}")
+    except Exception as exc:
+        print(f"[VOSK] Error descargando/preparando el modelo: {exc}")
+
+
 def ensure_paths() -> None:
     if not os.path.isdir(VOSK_MODEL_DIR):
-        raise FileNotFoundError(f"No se encontró el modelo de Vosk en {VOSK_MODEL_DIR}")
+        # Intento 1: detectar carpeta de modelo ya descomprimida en models/
+        try:
+            models_root = os.path.join(BASE_DIR, "models")
+            if os.path.isdir(models_root):
+                for name in os.listdir(models_root):
+                    cand = os.path.join(models_root, name)
+                    if os.path.isdir(cand) and name.startswith("vosk-model-"):
+                        # Preferir español si existe
+                        if "-es" in name or "_es" in name:
+                            globals()["VOSK_MODEL_DIR"] = cand
+                            break
+                # Si no se eligió español, tomar el primero que coincida
+                if not os.path.isdir(VOSK_MODEL_DIR):
+                    for name in os.listdir(models_root):
+                        cand = os.path.join(models_root, name)
+                        if os.path.isdir(cand) and name.startswith("vosk-model-"):
+                            globals()["VOSK_MODEL_DIR"] = cand
+                            break
+        except Exception:
+            pass
+        # Intento 2: descargar automáticamente el modelo grande de español
+        if not os.path.isdir(VOSK_MODEL_DIR):
+            _download_and_setup_vosk_model()
+        # Si aún no existe, abortar con error claro
+        if not os.path.isdir(VOSK_MODEL_DIR):
+            raise FileNotFoundError(f"No se encontró el modelo de Vosk en {VOSK_MODEL_DIR}")
     if not os.path.isfile(PIPER_MODEL) or not os.path.isfile(PIPER_CONFIG):
         raise FileNotFoundError(
             f"No se encontraron los archivos de voz de Piper en {os.path.dirname(PIPER_MODEL)}"
@@ -448,6 +523,28 @@ def _rms_int16(audio: np.ndarray) -> float:
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     return float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+
+
+def _aplay_tuning_args() -> list:
+    """Devuelve flags para aplay que ajustan buffer/periodo si están definidos.
+    Usa variables de entorno:
+      - APLAY_BUFFER_US (p.ej. 400000 → 400 ms)
+      - APLAY_PERIOD_US (p.ej. 100000 → 100 ms)
+    """
+    args: list = []
+    try:
+        buf_us = int(os.getenv("APLAY_BUFFER_US", "")) if os.getenv("APLAY_BUFFER_US") else 0
+    except Exception:
+        buf_us = 0
+    try:
+        per_us = int(os.getenv("APLAY_PERIOD_US", "")) if os.getenv("APLAY_PERIOD_US") else 0
+    except Exception:
+        per_us = 0
+    if buf_us > 0:
+        args += ["--buffer-time", str(buf_us)]
+    if per_us > 0:
+        args += ["--period-time", str(per_us)]
+    return args
 
 
 def speak(text: str) -> None:
@@ -476,13 +573,13 @@ def speak(text: str) -> None:
         assert proc_tts.stdin is not None and proc_tts.stdout is not None
 
         def build_aplay_cmd(use_plug: bool) -> list:
-            base = ["aplay", "-q", "-t", "wav", "-"]
+            base = ["aplay", "-q", "-t", "wav"] + _aplay_tuning_args() + ["-"]
             aplay_dev = os.getenv("APLAY_DEVICE")
             if aplay_dev:
                 dev = aplay_dev
                 if use_plug and aplay_dev.startswith("hw:"):
-                    dev = "plughw:" + aplay_dev.split(":", 1)[1]
-                return ["aplay", "-q", "-D", dev, "-t", "wav", "-"]
+                    dev = "hw:" + aplay_dev.split(":", 1)[1]
+                return ["aplay", "-q", "-D", dev, "-t", "wav"] + _aplay_tuning_args() + ["-"]
             return base
 
         # Si es dispositivo hw:* y tenemos sox, insertar conversión a 48k/16-bit/estéreo
@@ -546,7 +643,7 @@ def speak(text: str) -> None:
             aplay_dev_env = os.getenv("APLAY_DEVICE", "")
             # Intento alternativo: 'default' puro
             if aplay_dev_env and aplay_dev_env != "default":
-                aplay_cmd_def = ["aplay", "-q", "-D", "default", "-t", "wav", "-"]
+                aplay_cmd_def = ["aplay", "-q", "-D", "default", "-t", "wav"] + _aplay_tuning_args() + ["-"]
                 print(f"[TTS] Reintentando con dispositivo 'default': {' '.join(aplay_cmd_def)}")
                 proc_tts = subprocess.Popen(
                     cmd,
@@ -639,7 +736,7 @@ def speak(text: str) -> None:
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                         )
-                        aplay_cmd_hw = ["aplay", "-q", "-D", aplay_dev_env, "-t", "wav", "-"]
+                        aplay_cmd_hw = ["aplay", "-q", "-D", aplay_dev_env, "-t", "wav"] + _aplay_tuning_args() + ["-"]
                         print(f"[TTS] Encadenando aplay (hw) tras sox: {' '.join(aplay_cmd_hw)}")
                         proc_play = subprocess.Popen(
                             aplay_cmd_hw,
@@ -735,8 +832,8 @@ def speak(text: str) -> None:
 
         def build_wav_cmd(device: str | None) -> list:
             if device is None:
-                return ["aplay", "-q", "-t", "wav", "-"]
-            return ["aplay", "-q", "-D", device, "-t", "wav", "-"]
+                return ["aplay", "-q", "-t", "wav"] + _aplay_tuning_args() + ["-"]
+            return ["aplay", "-q", "-D", device, "-t", "wav"] + _aplay_tuning_args() + ["-"]
 
         # Intentar con APLAY_DEVICE
         device_env = os.getenv("APLAY_DEVICE")
@@ -762,6 +859,21 @@ def speak(text: str) -> None:
                 print(f"[TTS] Error lanzando aplay (WAV) con dispositivo {dev or 'por defecto'}: {exc_}")
     except Exception as exc:
         print(f"[TTS] Error en fallback Piper-tts (streaming): {exc}")
+
+    # 3) Fallback opcional con espeak si está instalado y habilitado
+    try:
+        if os.getenv("USE_ESPEAK_FALLBACK", "0").lower() in {"1", "true", "yes"}:
+            if shutil.which("espeak") is not None:
+                print("[TTS] Fallback a espeak activado")
+                subprocess.run([
+                    "espeak",
+                    "-v", os.getenv("ESPEAK_VOICE", "es"),
+                    "-s", os.getenv("ESPEAK_SPEED", "180"),
+                    text,
+                ])
+                return
+    except Exception:
+        pass
 
 
 def _generate_beep_wav_bytes(frequency_hz: int, duration_ms: int, volume: float = 0.25) -> bytes:
@@ -792,22 +904,43 @@ def _generate_beep_wav_bytes(frequency_hz: int, duration_ms: int, volume: float 
 def play_earcon(kind: str) -> None:
     try:
         if kind == "start_listen":
-            wav_bytes = _generate_beep_wav_bytes(1200, 250, volume=0.55)
+            wav_bytes = _generate_beep_wav_bytes(1200, 250, volume=0.99)
         elif kind == "end_listen":
-            wav_bytes = _generate_beep_wav_bytes(1200, 180, volume=0.55)
+            wav_bytes = _generate_beep_wav_bytes(1200, 180, volume=0.99)
+        elif kind == "startup":
+            wav_bytes = _generate_beep_wav_bytes(800, 300, volume=0.99)
         else:
             wav_bytes = _generate_beep_wav_bytes(1200, 200, volume=0.55)
 
-        aplay_cmd = ["aplay", "-q", "-t", "wav", "-"]
+        aplay_cmd = ["aplay", "-q", "-t", "wav"] + _aplay_tuning_args() + ["-"]
         dev = os.getenv("APLAY_DEVICE")
         if dev:
-            aplay_cmd = ["aplay", "-q", "-D", dev, "-t", "wav", "-"]
+            aplay_cmd = ["aplay", "-q", "-D", dev, "-t", "wav"] + _aplay_tuning_args() + ["-"]
         p = subprocess.run(aplay_cmd, input=wav_bytes, capture_output=True)
-        if p.returncode != 0 and dev and dev.startswith("hw:"):
-            # Reintentar con 'default' si hw falla
-            subprocess.run(["aplay", "-q", "-D", "default", "-t", "wav", "-"], input=wav_bytes)
+        if p.returncode != 0:
+            try:
+                err = (p.stderr or b"").decode(errors="ignore").strip()
+                if err:
+                    print(f"[TTS] aplay earcon error ({dev or 'por defecto'}): {err}")
+            except Exception:
+                pass
+            # Reintentar con 'default' si cualquier dispositivo personalizado falla
+            if dev:
+                subprocess.run(["aplay", "-q", "-D", "default", "-t", "wav"] + _aplay_tuning_args() + ["-"], input=wav_bytes)
     except Exception:
         # No romper el flujo por un beep
+        pass
+
+
+def play_startup_beep() -> None:
+    """Reproduce un pitido de inicio cuando el asistente se arranca."""
+    try:
+        print("[Inicio] Reproduciendo pitido de inicio...")
+        play_earcon("startup")
+        print("[Inicio] Pitido de inicio completado")
+    except Exception as exc:
+        print(f"[Inicio] Error reproduciendo pitido de inicio: {exc}")
+        # No fallar el arranque por un pitido
         pass
 
 
@@ -821,6 +954,11 @@ class AudioPipeline:
         self.proc_sox: Optional[subprocess.Popen] = None
         self.proc_play: Optional[subprocess.Popen] = None
         self.stdin = None
+        self._buffer = bytearray()
+        try:
+            self._min_flush_bytes = int(os.getenv("APLAY_MIN_CHUNK_BYTES", "16384"))
+        except Exception:
+            self._min_flush_bytes = 16384
         self._start_pipeline()
 
     def _start_pipeline(self) -> None:
@@ -852,7 +990,7 @@ class AudioPipeline:
             )
             assert self.proc_sox.stdin is not None and self.proc_sox.stdout is not None
             self.stdin = self.proc_sox.stdin
-            play_cmd = ["aplay", "-q", "-D", device, "-t", "wav", "-"] if device else ["aplay", "-q", "-t", "wav", "-"]
+            play_cmd = ["aplay", "-q", "-D", device, "-t", "wav"] + _aplay_tuning_args() + ["-"] if device else ["aplay", "-q", "-t", "wav"] + _aplay_tuning_args() + ["-"]
             self.proc_play = subprocess.Popen(
                 play_cmd,
                 stdin=self.proc_sox.stdout,
@@ -860,6 +998,62 @@ class AudioPipeline:
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
+            # Preflight: comprobar que aplay quedó vivo
+            try:
+                time.sleep(0.05)
+                if self.proc_play.poll() not in (None,):
+                    raise RuntimeError("aplay terminó prematuramente")
+            except Exception:
+                # Fallback a dispositivo por defecto
+                try:
+                    if self.stdin:
+                        try:
+                            self.stdin.close()
+                        except Exception:
+                            pass
+                    if self.proc_sox:
+                        try:
+                            self.proc_sox.kill()
+                        except Exception:
+                            pass
+                    if self.proc_play:
+                        try:
+                            self.proc_play.kill()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                print("[TTS-Pipeline] Fallback a dispositivo 'default' tras fallo inicial (hw + sox)")
+                # Reiniciar sin especificar -D (usa default)
+                self.proc_sox = subprocess.Popen(
+                    [
+                        "sox",
+                        "-t", "raw",
+                        "-r", str(self.input_rate),
+                        "-e", "signed",
+                        "-b", "16",
+                        "-c", "1",
+                        "-L",
+                        "-",
+                        "-r", "48000",
+                        "-b", "16",
+                        "-c", "2",
+                        "-t", "wav", "-",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+                assert self.proc_sox.stdin is not None and self.proc_sox.stdout is not None
+                self.stdin = self.proc_sox.stdin
+                self.proc_play = subprocess.Popen(
+                    ["aplay", "-q", "-t", "wav"] + _aplay_tuning_args() + ["-"],
+                    stdin=self.proc_sox.stdout,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
         else:
             # Directo a aplay en RAW (usa plughw si así está en APLAY_DEVICE)
             target = device if device else "(por defecto)"
@@ -870,8 +1064,7 @@ class AudioPipeline:
                 "-f", "S16_LE",
                 "-c", "1",
                 "-r", str(self.input_rate),
-                "-",
-            ]
+            ] + _aplay_tuning_args() + ["-"]
             if device:
                 play_cmd = [
                     "aplay", "-q",
@@ -880,8 +1073,7 @@ class AudioPipeline:
                     "-f", "S16_LE",
                     "-c", "1",
                     "-r", str(self.input_rate),
-                    "-",
-                ]
+                ] + _aplay_tuning_args() + ["-"]
             self.proc_play = subprocess.Popen(
                 play_cmd,
                 stdin=subprocess.PIPE,
@@ -891,6 +1083,48 @@ class AudioPipeline:
             )
             assert self.proc_play.stdin is not None
             self.stdin = self.proc_play.stdin
+            # Preflight: escribir un pequeño buffer de silencio para detectar BrokenPipe inmediato
+            try:
+                test_bytes = b"\x00" * max(1024, self._min_flush_bytes // 2)
+                self.stdin.write(test_bytes)
+                try:
+                    self.stdin.flush()
+                except Exception:
+                    pass
+                time.sleep(0.05)
+                if self.proc_play.poll() not in (None,):
+                    raise RuntimeError("aplay terminó prematuramente")
+            except Exception:
+                # Cerrar y reintentar con 'default'
+                try:
+                    if self.stdin:
+                        try:
+                            self.stdin.close()
+                        except Exception:
+                            pass
+                    if self.proc_play:
+                        try:
+                            self.proc_play.kill()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                print("[TTS-Pipeline] Fallback a dispositivo 'default' tras fallo inicial (raw)")
+                self.proc_play = subprocess.Popen(
+                    [
+                        "aplay", "-q",
+                        "-t", "raw",
+                        "-f", "S16_LE",
+                        "-c", "1",
+                        "-r", str(self.input_rate),
+                    ] + _aplay_tuning_args() + ["-"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+                assert self.proc_play.stdin is not None
+                self.stdin = self.proc_play.stdin
 
     def write(self, data: bytes) -> None:
         if not data:
@@ -898,11 +1132,14 @@ class AudioPipeline:
         if self.stdin is None:
             return
         try:
-            self.stdin.write(data)
-            try:
-                self.stdin.flush()
-            except Exception:
-                pass
+            self._buffer.extend(data)
+            if len(self._buffer) >= self._min_flush_bytes:
+                self.stdin.write(self._buffer)
+                self._buffer.clear()
+                try:
+                    self.stdin.flush()
+                except Exception:
+                    pass
         except Exception:
             # Intentar no romper la app si el dispositivo desaparece
             pass
@@ -911,6 +1148,12 @@ class AudioPipeline:
         try:
             if self.stdin:
                 try:
+                    if self._buffer:
+                        try:
+                            self.stdin.write(self._buffer)
+                        except Exception:
+                            pass
+                        self._buffer.clear()
                     self.stdin.flush()
                 except Exception:
                     pass
@@ -1290,6 +1533,10 @@ def main() -> None:
     # Lanzar siempre la UI de configuración en segundo plano
     start_config_server()
     print("Asistente listo. Di 'asistente' para activar.")
+    
+    # Reproducir pitido de inicio
+    play_startup_beep()
+    
     cooldown_end_ts = 0.0
 
     while True:
